@@ -50,11 +50,9 @@ async def start(message: types.Message):
 
 @dp.message_handler()
 async def chat(message: types.Message):
-    # typing...
     await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
 
-    wait_msg = await message.answer("🤔 Думаю...")
-    sticker_msg = await message.answer_sticker(WAIT_STICKER_ID)
+    wait_msg = await message.answer("🤔 Думаю над ответом...")
 
     try:
         response = client.chat.completions.create(
@@ -70,13 +68,10 @@ async def chat(message: types.Message):
         answer = response.choices[0].message.content
 
         await wait_msg.delete()
-        await sticker_msg.delete()
-
         await message.answer(answer)
 
     except Exception as e:
         await wait_msg.delete()
-        await sticker_msg.delete()
         await message.answer("⚠️ Ошибка. Попробуй позже.")
 
 # -------------------
