@@ -2,10 +2,12 @@ import os
 import logging
 import random
 
-from aiogram import Bot, Dispatcher, executor, types
+from aiogram import Bot, Dispatcher, types
 from aiogram.types import ChatActions
+from aiogram.utils.executor import start_webhook
 from dotenv import load_dotenv
 from openai import OpenAI
+from aiohttp import web
 
 # =========================
 # LOAD ENV
@@ -14,11 +16,15 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not found")
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY not found")
+WEBHOOK_HOST = WEBHOOK_URL
+WEBHOOK_ENDPOINT = WEBHOOK_PATH
+WEBHOOK_FULL_URL = f"{WEBHOOK_HOST}{WEBHOOK_ENDPOINT}"
+
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", 10000))
 
 # =========================
 # LOGGING
@@ -30,23 +36,19 @@ logging.basicConfig(level=logging.INFO)
 # =========================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# STICKERS (ВСТАВЬ СВОИ file_id)
+# STICKERS
 # =========================
 STICKERS_THINK = [
-    "CAACAgIAAxkBAAEVFAVpXQGPm-bC7Az8qjshrZK7S82a2wACfgADwZxgDAsUf929Iv3zOAQ",
-    "CAACAgIAAxkBAAEVFAdpXQI0gobiAo031YwBUpOU400JjQACrjgAAtuNYEloV73kP0r9tjgE",
-    "CAACAgIAAxkBAAEVFAlpXQJyKd4Bjm3ursoKD2Zi5Y30OwACGAADwDZPE9b6J7-cahj4OAQ",
-    "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
-    "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ",
-    "CAACAgIAAxkBAAEVFBNpXQLlrJzvfTuILhTdtXxLn_eLugACMgEAAlKJkSNZdMrsEXdk9TgE",
+    "PASTE_THINK_1",
+    "PASTE_THINK_2",
+    "PASTE_THINK_3",
 ]
 
 STICKER_HELLO = "PASTE_HELLO"
-STICKER_HELP = "PASTE_HELP"   # «рад помочь»
+STICKER_HELP = "PASTE_HELP"
 STICKER_ERROR = "PASTE_ERROR"
 
 # =========================
@@ -54,48 +56,33 @@ STICKER_ERROR = "PASTE_ERROR"
 # =========================
 def detect_style(text: str) -> str:
     t = text.lower()
-
-    if any(x in t for x in ["как", "почему", "ошибка", "не работает", "сделать"]):
+    if any(x in t for x in ["как", "почему", "ошибка", "не работает"]):
         return "help"
-
-    if any(x in t for x in ["придумай", "сценарий", "текст", "идею", "креатив"]):
+    if any(x in t for x in ["придумай", "сценарий", "идею"]):
         return "creative"
-
-    if any(x in t for x in ["объясни", "что такое", "значит", "пример"]):
+    if any(x in t for x in ["объясни", "что такое"]):
         return "explain"
-
     return "chat"
 
-# =========================
-# PROMPTS
-# =========================
 PROMPTS = {
-    "chat": "Отвечай дружелюбно и по-человечески, как в обычном разговоре.",
-    "help": "Отвечай спокойно, пошагово и поддерживающе, помогая разобраться.",
-    "creative": "Отвечай креативно, вдохновляюще, с образами и идеями.",
-    "explain": "Объясняй просто и понятно, без заумных слов."
+    "chat": "Отвечай дружелюбно, легко и по-человечески.",
+    "help": "Отвечай спокойно и пошагово, помогая разобраться.",
+    "creative": "Отвечай креативно и вдохновляюще.",
+    "explain": "Объясняй просто и понятно."
 }
 
 # =========================
-# /START
+# HANDLERS
 # =========================
 @dp.message_handler(commands=["start"])
 async def start(message: types.Message):
     await message.answer_sticker(STICKER_HELLO)
-    await message.answer(
-        "Привет!\n\n"
-        "Я здесь, чтобы помочь 🙂\n"
-        "Задавай любой вопрос или просто напиши."
-    )
+    await message.answer("Привет! Я здесь, чтобы помочь 🙂")
 
-# =========================
-# CHAT
-# =========================
 @dp.message_handler()
 async def chat(message: types.Message):
     await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
-
-    think_sticker = await message.answer_sticker(random.choice(STICKERS_THINK))
+    think = await message.answer_sticker(random.choice(STICKERS_THINK))
 
     style = detect_style(message.text)
 
@@ -106,7 +93,7 @@ async def chat(message: types.Message):
                 {
                     "role": "system",
                     "content": f"""
-Ты дружелюбный и вежливый собеседник.
+Ты дружелюбный собеседник.
 {PROMPTS[style]}
 """
                 },
@@ -116,27 +103,39 @@ async def chat(message: types.Message):
             max_tokens=700
         )
 
-        answer = response.choices[0].message.content
+        await think.delete()
+        await message.answer(response.choices[0].message.content)
 
-        await think_sticker.delete()
-        await message.answer(answer)
-
-        # 🫶 СТИКЕР «РАД ПОМОЧЬ» (НЕ ВСЕГДА)
-        if (
-            len(answer) < 400
-            or any(x in message.text.lower() for x in ["спасибо", "благодарю"])
-        ):
-            if random.random() < 0.6:  # 60% шанс
-                await message.answer_sticker(STICKER_HELP)
+        if random.random() < 0.6:
+            await message.answer_sticker(STICKER_HELP)
 
     except Exception as e:
         logging.error(e)
-        await think_sticker.delete()
+        await think.delete()
         await message.answer_sticker(STICKER_ERROR)
-        await message.answer("Что-то пошло не так. Давай попробуем ещё раз чуть позже.")
+        await message.answer("Что-то пошло не так. Попробуем ещё раз.")
 
 # =========================
-# START BOT
+# WEBHOOK STARTUP / SHUTDOWN
+# =========================
+async def on_startup(dp):
+    await bot.set_webhook(WEBHOOK_FULL_URL)
+    logging.info(f"Webhook set: {WEBHOOK_FULL_URL}")
+
+async def on_shutdown(dp):
+    await bot.delete_webhook()
+    await bot.session.close()
+
+# =========================
+# START WEBHOOK
 # =========================
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_ENDPOINT,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        skip_updates=True,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+    )
