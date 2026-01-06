@@ -1,8 +1,9 @@
 import os
 import logging
+import asyncio
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ChatActions, Update
+from aiogram.types import ChatActions
 from aiogram.utils.executor import start_webhook
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -15,8 +16,11 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://bot-iivideo.onrender.com
+
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+PORT = int(os.environ.get("PORT", 10000))
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not found")
@@ -42,8 +46,23 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # =========================
 SYSTEM_PROMPT = """
 Ты дружелюбный, умный ChatGPT.
-Отвечай живо и по-человечески.
+Отвечай живо, по-человечески и полезно.
 """
+
+# =========================
+# OPENAI SYNC CALL
+# =========================
+def ask_gpt_sync(user_text: str) -> str:
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text}
+        ],
+        temperature=0.9,
+        max_tokens=800
+    )
+    return response.choices[0].message.content
 
 # =========================
 # HANDLERS
@@ -55,26 +74,23 @@ async def start_cmd(message: types.Message):
 @dp.message_handler()
 async def chat(message: types.Message):
     await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
+    wait_msg = await message.answer("🤔 Думаю...")
 
-    wait = await message.answer("🤔 Думаю...")
+    loop = asyncio.get_event_loop()
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": message.text}
-            ],
-            temperature=0.9,
-            max_tokens=800
+        answer = await loop.run_in_executor(
+            None,
+            ask_gpt_sync,
+            message.text
         )
 
-        await wait.delete()
-        await message.answer(response.choices[0].message.content)
+        await wait_msg.delete()
+        await message.answer(answer)
 
     except Exception as e:
-        logging.error(e)
-        await wait.delete()
+        logging.exception("OpenAI error")
+        await wait_msg.delete()
         await message.answer("⚠️ Ошибка. Попробуй позже.")
 
 # =========================
@@ -99,5 +115,5 @@ if __name__ == "__main__":
         on_shutdown=on_shutdown,
         skip_updates=True,
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
+        port=PORT,
     )
