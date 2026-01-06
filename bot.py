@@ -4,7 +4,6 @@ import asyncio
 from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ChatActions
 from aiogram.utils.executor import start_webhook
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -17,6 +16,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
+
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
@@ -36,45 +36,58 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # MEMORY
 # =========================
 dialog_history = defaultdict(list)
-MAX_HISTORY = 6  # 🔴 ВАЖНО: уменьшили
+MAX_HISTORY = 6
 
-SYSTEM_PROMPT = "Ты дружелюбный, живой и полезный ассистент."
+SYSTEM_PROMPT = "Ты дружелюбный, умный и живой ассистент."
 
 # =========================
-# GPT
+# QUEUE
 # =========================
-async def ask_gpt_and_reply(chat_id: int, text: str):
-    try:
-        history = dialog_history[chat_id]
+request_queue = asyncio.Queue()
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *history,
-            {"role": "user", "content": text},
-        ]
+# =========================
+# GPT WORKER
+# =========================
+async def gpt_worker():
+    logging.info("🧠 GPT worker started")
 
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.9,
-            max_tokens=600,
-        )
+    while True:
+        chat_id, text = await request_queue.get()
 
-        answer = response.choices[0].message.content
+        try:
+            history = dialog_history[chat_id]
 
-        history.extend([
-            {"role": "user", "content": text},
-            {"role": "assistant", "content": answer},
-        ])
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                *history,
+                {"role": "user", "content": text},
+            ]
 
-        dialog_history[chat_id] = history[-MAX_HISTORY:]
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.9,
+                max_tokens=600,
+            )
 
-        await bot.send_message(chat_id, answer)
+            answer = response.choices[0].message.content
 
-    except Exception as e:
-        logging.exception(e)
-        await bot.send_message(chat_id, "⚠️ GPT временно недоступен")
+            history.extend([
+                {"role": "user", "content": text},
+                {"role": "assistant", "content": answer},
+            ])
+
+            dialog_history[chat_id] = history[-MAX_HISTORY:]
+
+            await bot.send_message(chat_id, answer)
+
+        except Exception as e:
+            logging.exception(e)
+            await bot.send_message(chat_id, "⚠️ Ошибка GPT, попробуй позже")
+
+        finally:
+            request_queue.task_done()
 
 # =========================
 # HANDLERS
@@ -90,12 +103,12 @@ async def reset_cmd(message: types.Message):
 
 @dp.message_handler()
 async def chat(message: types.Message):
-    # 🔴 СРАЗУ отвечаем Telegram
+    # ⚡ мгновенный ответ Telegram
     await message.answer("🤔 Думаю...")
 
-    # 🔥 GPT уходит в фон
-    asyncio.create_task(
-        ask_gpt_and_reply(message.chat.id, message.text)
+    # ➕ кладём в очередь
+    await request_queue.put(
+        (message.chat.id, message.text)
     )
 
 # =========================
@@ -104,6 +117,9 @@ async def chat(message: types.Message):
 async def on_startup(dp):
     await bot.set_webhook(WEBHOOK_URL)
     logging.info(f"Webhook set: {WEBHOOK_URL}")
+
+    # 🚀 запускаем 1 воркер
+    asyncio.create_task(gpt_worker())
 
 async def on_shutdown(dp):
     await bot.delete_webhook()
