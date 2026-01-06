@@ -120,4 +120,38 @@ async def chat(message: types.Message):
         except Exception as e:
             logging.error(e)
 
-            # пробуем удалить сти
+            # пробуем удалить стикер даже при ошибке
+            try:
+                await bot.delete_message(
+                    message.chat.id,
+                    sticker_msg.message_id
+                )
+            except:
+                pass
+
+            await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
+
+# =========================
+# WEBHOOK
+# =========================
+async def on_startup(dp):
+    await bot.set_webhook(WEBHOOK_URL)
+    logging.info(f"Webhook set: {WEBHOOK_URL}")
+
+async def on_shutdown(dp):
+    await bot.delete_webhook()
+    await bot.session.close()
+
+# =========================
+# START
+# =========================
+if __name__ == "__main__":
+    start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_PATH,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        skip_updates=True,
+        host="0.0.0.0",
+        port=PORT,
+    )
