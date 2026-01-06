@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ChatActions
@@ -16,18 +17,11 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://bot-iivideo.onrender.com
-
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-PORT = int(os.environ.get("PORT", 10000))
-
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not found")
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY not found")
-if not WEBHOOK_HOST:
-    raise ValueError("WEBHOOK_HOST not found")
+if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_HOST:
+    raise ValueError("ENV variables missing")
 
 # =========================
 # LOGGING
@@ -44,54 +38,80 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # =========================
 # SYSTEM PROMPT
 # =========================
-SYSTEM_PROMPT = """
-Ты дружелюбный, умный ChatGPT.
-Отвечай живо, по-человечески и полезно.
-"""
+SYSTEM_PROMPT = (
+    "Ты дружелюбный, умный ChatGPT. "
+    "Отвечай кратко, живо и по-человечески."
+)
 
 # =========================
-# OPENAI SYNC CALL
+# MEMORY
 # =========================
-def ask_gpt_sync(user_text: str) -> str:
+dialog_history = defaultdict(list)
+MAX_HISTORY = 8  # 4 вопроса + 4 ответа
+
+# =========================
+# OPENAI (SYNC)
+# =========================
+def ask_gpt(chat_id: int, text: str) -> str:
+    history = dialog_history[chat_id]
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *history,
+        {"role": "user", "content": text},
+    ]
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text}
-        ],
+        messages=messages,
         temperature=0.9,
-        max_tokens=800
+        max_tokens=700,
     )
-    return response.choices[0].message.content
+
+    answer = response.choices[0].message.content
+
+    history.append({"role": "user", "content": text})
+    history.append({"role": "assistant", "content": answer})
+
+    if len(history) > MAX_HISTORY:
+        dialog_history[chat_id] = history[-MAX_HISTORY:]
+
+    return answer
 
 # =========================
 # HANDLERS
 # =========================
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
-    await message.answer("👋 Я жив и готов помочь!")
+    await message.answer("👋 Я жив. Пиши.")
+
+@dp.message_handler(commands=["reset"])
+async def reset_cmd(message: types.Message):
+    dialog_history.pop(message.chat.id, None)
+    await message.answer("🧠 Память очищена.")
 
 @dp.message_handler()
 async def chat(message: types.Message):
     await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
-    wait_msg = await message.answer("🤔 Думаю...")
+    wait = await message.answer("🤔 Думаю...")
 
     loop = asyncio.get_event_loop()
 
     try:
         answer = await loop.run_in_executor(
             None,
-            ask_gpt_sync,
+            ask_gpt,
+            message.chat.id,
             message.text
         )
 
-        await wait_msg.delete()
+        await wait.delete()
         await message.answer(answer)
 
     except Exception as e:
-        logging.exception("OpenAI error")
-        await wait_msg.delete()
-        await message.answer("⚠️ Ошибка. Попробуй позже.")
+        logging.exception(e)
+        await wait.delete()
+        await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
 
 # =========================
 # WEBHOOK START / STOP
@@ -105,7 +125,7 @@ async def on_shutdown(dp):
     await bot.session.close()
 
 # =========================
-# START WEBHOOK
+# START
 # =========================
 if __name__ == "__main__":
     start_webhook(
@@ -115,5 +135,5 @@ if __name__ == "__main__":
         on_shutdown=on_shutdown,
         skip_updates=True,
         host="0.0.0.0",
-        port=PORT,
+        port=int(os.environ.get("PORT", 10000)),
     )
