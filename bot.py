@@ -1,49 +1,49 @@
 import os
+import asyncio
 from aiogram import Bot, Dispatcher, executor, types
+from fastapi import FastAPI
+import uvicorn
+from threading import Thread
 from dotenv import load_dotenv
 
 load_dotenv()
 
-API_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", 10000))
 
-bot = Bot(token=API_TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# Кнопки
-main_kb = types.InlineKeyboardMarkup(row_width=2)
-main_kb.add(
-    types.InlineKeyboardButton("📝 Сгенерировать текст", callback_data="text"),
-    types.InlineKeyboardButton("🎬 Идея видео", callback_data="video")
-)
+# ---------- Telegram handlers ----------
 
 @dp.message_handler(commands=["start"])
 async def start(message: types.Message):
     await message.answer(
-        "Привет 👋\nЯ помогу с контентом для Reels.\nВыбери, что нужно:",
-        reply_markup=main_kb
+        "👋 Привет!\n\n"
+        "Я бот.\n"
+        "Скоро здесь будет генерация текста и видео 🎬"
     )
 
-@dp.callback_query_handler(lambda c: c.data == "text")
-async def gen_text(callback: types.CallbackQuery):
-    text = (
-        "«Никто не скажет, что ты готов.\n"
-        "Ты просто встаёшь — и делаешь.\n"
-        "А потом это называют успехом.»"
-    )
-    await callback.message.answer(text)
-    await callback.answer()
+@dp.message_handler()
+async def echo(message: types.Message):
+    await message.answer("Я получил сообщение ✅")
 
-@dp.callback_query_handler(lambda c: c.data == "video")
-async def gen_video(callback: types.CallbackQuery):
-    idea = (
-        "🎬 Идея Reels:\n"
-        "Кадр: ты идёшь по улице ночью\n"
-        "Текст на экране:\n"
-        "«Я не стал лучше.\n"
-        "Я просто перестал сдаваться.»»"
-    )
-    await callback.message.answer(idea)
-    await callback.answer()
+# ---------- FastAPI (для Render) ----------
+
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"status": "ok", "bot": "running"}
+
+def run_web():
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
+
+# ---------- Start everything ----------
 
 if __name__ == "__main__":
+    # запускаем web-сервер в отдельном потоке
+    Thread(target=run_web).start()
+
+    # запускаем бота
     executor.start_polling(dp, skip_updates=True)
