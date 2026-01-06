@@ -1,6 +1,7 @@
 import os
 import logging
 import random
+import asyncio
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import ChatActions
@@ -67,30 +68,28 @@ async def start(message: types.Message):
 # =========================
 # CHAT
 # =========================
+
 @dp.message_handler()
 async def chat(message: types.Message):
-    await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
+    await message.answer_chat_action("typing")
 
-    # 🎯 случайный «думаю» стикер
-    await message.answer_sticker(random.choice(THINKING_STICKERS))
-
-    try:
-        response = client.chat.completions.create(
+    def ask_openai():
+        return client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": message.text},
-            ],
-            temperature=0.9,
-            max_tokens=700,
+                {"role": "system", "content": "Ты дружелюбный помощник"},
+                {"role": "user", "content": message.text}
+            ]
         )
 
+    try:
+        response = await asyncio.to_thread(ask_openai)
         answer = response.choices[0].message.content
         await message.answer(answer)
 
     except Exception as e:
-        logging.exception(e)
-        await message.answer("Что-то пошло не так 😕 Попробуй ещё раз.")
+        await message.answer("⚠️ Что-то пошло не так, попробуй ещё раз")
+        print(e)
 
 # =========================
 # START (POLLING)
