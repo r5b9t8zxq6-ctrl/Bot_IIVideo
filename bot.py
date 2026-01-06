@@ -1,61 +1,49 @@
 import os
-import logging
 from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
 load_dotenv()
 
-API_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-logging.basicConfig(level=logging.INFO)
+API_TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-# ===== КНОПКИ =====
-def main_menu():
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("✍️ Генерировать текст", callback_data="gen_text"),
-        InlineKeyboardButton("🎥 Генерировать видео", callback_data="gen_video"),
-    )
-    return keyboard
+# Кнопки
+main_kb = types.InlineKeyboardMarkup(row_width=2)
+main_kb.add(
+    types.InlineKeyboardButton("📝 Сгенерировать текст", callback_data="text"),
+    types.InlineKeyboardButton("🎬 Идея видео", callback_data="video")
+)
 
-
-# ===== /start =====
 @dp.message_handler(commands=["start"])
 async def start(message: types.Message):
     await message.answer(
-        "Выбери, что нужно сгенерировать 👇",
-        reply_markup=main_menu()
+        "Привет 👋\nЯ помогу с контентом для Reels.\nВыбери, что нужно:",
+        reply_markup=main_kb
     )
 
-
-# ===== ОБРАБОТКА КНОПОК =====
-@dp.callback_query_handler(lambda c: c.data == "gen_text")
-async def text_button(callback: types.CallbackQuery):
-    await callback.message.answer("✍️ Напиши тему или запрос для текста:")
+@dp.callback_query_handler(lambda c: c.data == "text")
+async def gen_text(callback: types.CallbackQuery):
+    text = (
+        "«Никто не скажет, что ты готов.\n"
+        "Ты просто встаёшь — и делаешь.\n"
+        "А потом это называют успехом.»"
+    )
+    await callback.message.answer(text)
     await callback.answer()
 
-
-@dp.callback_query_handler(lambda c: c.data == "gen_video")
-async def video_button(callback: types.CallbackQuery):
-    await callback.message.answer("🎥 Опиши сцену для видео:")
+@dp.callback_query_handler(lambda c: c.data == "video")
+async def gen_video(callback: types.CallbackQuery):
+    idea = (
+        "🎬 Идея Reels:\n"
+        "Кадр: ты идёшь по улице ночью\n"
+        "Текст на экране:\n"
+        "«Я не стал лучше.\n"
+        "Я просто перестал сдаваться.»»"
+    )
+    await callback.message.answer(idea)
     await callback.answer()
-
-
-# ===== ГЕНЕРАЦИЯ ТЕКСТА (ЗАГЛУШКА) =====
-@dp.message_handler()
-async def generate(message: types.Message):
-    user_text = message.text
-
-    # Пока заглушка, дальше подключим OpenAI / Replicate
-    result_text = f"🧠 Сгенерированный результат:\n\n{user_text}"
-
-    await message.answer(result_text)
-    await message.answer("Хочешь ещё?", reply_markup=main_menu())
-
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
