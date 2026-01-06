@@ -1,5 +1,4 @@
 aiogram==2.25.1
-python-dotenv
-fastapi
-uvicorn
-openai
+aiohttp==3.8.6
+openai==2.14.0
+python-dotenv==1.2.1
