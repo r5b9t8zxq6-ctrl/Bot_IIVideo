@@ -10,18 +10,15 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 # =========================
-# LOAD ENV
+# ENV
 # =========================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://bot-iivideo.onrender.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-
-if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_HOST:
-    raise ValueError("ENV variables missing")
 
 # =========================
 # LOGGING
@@ -36,85 +33,73 @@ dp = Dispatcher(bot)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# SYSTEM PROMPT
-# =========================
-SYSTEM_PROMPT = (
-    "Ты дружелюбный, умный ChatGPT. "
-    "Отвечай кратко, живо и по-человечески."
-)
-
-# =========================
 # MEMORY
 # =========================
 dialog_history = defaultdict(list)
-MAX_HISTORY = 8  # 4 вопроса + 4 ответа
+MAX_HISTORY = 6  # 🔴 ВАЖНО: уменьшили
+
+SYSTEM_PROMPT = "Ты дружелюбный, живой и полезный ассистент."
 
 # =========================
-# OPENAI (SYNC)
+# GPT
 # =========================
-def ask_gpt(chat_id: int, text: str) -> str:
-    history = dialog_history[chat_id]
+async def ask_gpt_and_reply(chat_id: int, text: str):
+    try:
+        history = dialog_history[chat_id]
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        *history,
-        {"role": "user", "content": text},
-    ]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *history,
+            {"role": "user", "content": text},
+        ]
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0.9,
-        max_tokens=700,
-    )
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.9,
+            max_tokens=600,
+        )
 
-    answer = response.choices[0].message.content
+        answer = response.choices[0].message.content
 
-    history.append({"role": "user", "content": text})
-    history.append({"role": "assistant", "content": answer})
+        history.extend([
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": answer},
+        ])
 
-    if len(history) > MAX_HISTORY:
         dialog_history[chat_id] = history[-MAX_HISTORY:]
 
-    return answer
+        await bot.send_message(chat_id, answer)
+
+    except Exception as e:
+        logging.exception(e)
+        await bot.send_message(chat_id, "⚠️ GPT временно недоступен")
 
 # =========================
 # HANDLERS
 # =========================
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
-    await message.answer("👋 Я жив. Пиши.")
+    await message.answer("👋 Я готов. Пиши.")
 
 @dp.message_handler(commands=["reset"])
 async def reset_cmd(message: types.Message):
     dialog_history.pop(message.chat.id, None)
-    await message.answer("🧠 Память очищена.")
+    await message.answer("🧠 Память очищена")
 
 @dp.message_handler()
 async def chat(message: types.Message):
-    await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
-    wait = await message.answer("🤔 Думаю...")
+    # 🔴 СРАЗУ отвечаем Telegram
+    await message.answer("🤔 Думаю...")
 
-    loop = asyncio.get_event_loop()
-
-    try:
-        answer = await loop.run_in_executor(
-            None,
-            ask_gpt,
-            message.chat.id,
-            message.text
-        )
-
-        await wait.delete()
-        await message.answer(answer)
-
-    except Exception as e:
-        logging.exception(e)
-        await wait.delete()
-        await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
+    # 🔥 GPT уходит в фон
+    asyncio.create_task(
+        ask_gpt_and_reply(message.chat.id, message.text)
+    )
 
 # =========================
-# WEBHOOK START / STOP
+# WEBHOOK
 # =========================
 async def on_startup(dp):
     await bot.set_webhook(WEBHOOK_URL)
