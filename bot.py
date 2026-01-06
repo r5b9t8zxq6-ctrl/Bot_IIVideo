@@ -1,100 +1,117 @@
 import os
-from threading import Thread
-
+import logging
 from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
-from fastapi import FastAPI
-import uvicorn
-
-from dotenv import load_dotenv
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 from openai import OpenAI
 
 # ---------- ENV ----------
-load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PORT = int(os.getenv("PORT", 10000))
+
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN не задан")
+if not OPENAI_API_KEY:
+    raise RuntimeError("❌ OPENAI_API_KEY не задан")
+
+# ---------- LOGGING ----------
+logging.basicConfig(level=logging.INFO)
 
 # ---------- INIT ----------
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher(bot, storage=MemoryStorage())
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- КНОПКИ ----------
-def main_keyboard():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("✍️ Сгенерировать текст", callback_data="gen_text"),
-        InlineKeyboardButton("🎬 Идея для видео", callback_data="gen_video"),
-        InlineKeyboardButton("📜 Сценарий Reels", callback_data="gen_script"),
-    )
+# ---------- STATES ----------
+class TextGen(StatesGroup):
+    topic = State()
+    style = State()
+    length = State()
+
+# ---------- KEYBOARDS ----------
+def main_menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("🧠 Сгенерировать текст")
     return kb
 
-# ---------- GPT ----------
-def generate_text():
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты мотивационный копирайтер. "
-                    "Пиши коротко, жёстко, цепляюще. "
-                    "Формат — текст для Reels."
-                )
-            },
-            {
-                "role": "user",
-                "content": "Сгенерируй мотивационный текст про рост и дисциплину"
-            }
-        ],
-        max_tokens=200,
-        temperature=0.9
-    )
-    return response.choices[0].message.content
+def after_text_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("🔄 Сгенерировать ещё")
+    kb.add("🏠 В меню")
+    return kb
 
-# ---------- ХЕНДЛЕРЫ ----------
+# ---------- START ----------
 @dp.message_handler(commands=["start"])
 async def start(message: types.Message):
     await message.answer(
-        "👋 Привет!\n\n"
-        "Я генерирую тексты и идеи для Reels.\n"
-        "Выбери действие:",
-        reply_markup=main_keyboard()
+        "Привет 👋\n\nЯ могу сгенерировать текст **на любую тему**.\n"
+        "Нажми кнопку ниже 👇",
+        reply_markup=main_menu()
     )
 
-@dp.callback_query_handler(lambda c: c.data == "gen_text")
-async def gen_text(callback: types.CallbackQuery):
-    await callback.message.answer("✍️ Генерирую текст...")
-    
-    text = generate_text()
+# ---------- MENU ----------
+@dp.message_handler(lambda m: m.text == "🏠 В меню", state="*")
+async def back_to_menu(message: types.Message, state: FSMContext):
+    await state.finish()
+    await start(message)
 
-    await callback.message.answer(text)
-    await callback.answer()
+# ---------- START GENERATION ----------
+@dp.message_handler(lambda m: m.text in ["🧠 Сгенерировать текст", "🔄 Сгенерировать ещё"])
+async def ask_topic(message: types.Message):
+    await TextGen.topic.set()
+    await message.answer("📌 Напиши тему текста\n\nНапример:\n• мотивация\n• бизнес\n• отношения\n• философия")
 
-@dp.callback_query_handler(lambda c: c.data == "gen_video")
-async def gen_video(callback: types.CallbackQuery):
-    await callback.message.answer("🎬 Генерация идей для видео — следующий шаг")
-    await callback.answer()
+# ---------- TOPIC ----------
+@dp.message_handler(state=TextGen.topic)
+async def get_topic(message: types.Message, state: FSMContext):
+    await state.update_data(topic=message.text)
+    await TextGen.next()
+    await message.answer("🎭 В каком стиле писать?\n\nНапример:\n• жёстко\n• мотивационно\n• философски\n• иронично")
 
-@dp.callback_query_handler(lambda c: c.data == "gen_script")
-async def gen_script(callback: types.CallbackQuery):
-    await callback.message.answer("📜 Генерация сценариев — скоро")
-    await callback.answer()
+# ---------- STYLE ----------
+@dp.message_handler(state=TextGen.style)
+async def get_style(message: types.Message, state: FSMContext):
+    await state.update_data(style=message.text)
+    await TextGen.next()
+    await message.answer("📏 Длина текста?\n\nНапример:\n• коротко\n• средне\n• длинно")
 
-# ---------- FASTAPI ----------
-app = FastAPI()
+# ---------- LENGTH + GENERATION ----------
+@dp.message_handler(state=TextGen.length)
+async def generate_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
 
-@app.get("/")
-def health():
-    return {"status": "ok"}
+    topic = data["topic"]
+    style = data["style"]
+    length = message.text
 
-def run_web():
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    prompt = (
+        f"Сгенерируй текст на тему: {topic}.\n"
+        f"Стиль: {style}.\n"
+        f"Длина: {length}.\n\n"
+        "Текст должен быть живым, цепляющим и понятным."
+    )
 
-# ---------- START ----------
+    await message.answer("⏳ Генерирую текст...")
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Ты профессиональный автор текстов."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+
+    text = response.choices[0].message.content
+
+    await message.answer(
+        f"✨ **Готово:**\n\n{text}",
+        reply_markup=after_text_kb(),
+        parse_mode="Markdown"
+    )
+
+    await state.finish()
+
+# ---------- RUN ----------
 if __name__ == "__main__":
-    Thread(target=run_web).start()
     executor.start_polling(dp, skip_updates=True)
