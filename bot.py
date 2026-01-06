@@ -9,7 +9,6 @@ from aiogram.types import ChatActions
 from aiogram.utils.executor import start_webhook
 from dotenv import load_dotenv
 from openai import OpenAI
-from aiohttp import web
 
 # =========================
 # ENV
@@ -18,11 +17,14 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://xxx.onrender.com
+PORT = int(os.environ.get("PORT", 10000))
 
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-PORT = int(os.environ.get("PORT", 10000))
+
+if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_HOST:
+    raise RuntimeError("❌ Проверь BOT_TOKEN / OPENAI_API_KEY / WEBHOOK_HOST")
 
 # =========================
 # LOGGING
@@ -37,7 +39,7 @@ dp = Dispatcher(bot)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# STICKERS
+# STICKERS (ЗАМЕНИ ПРИ ЖЕЛАНИИ)
 # =========================
 THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ",
@@ -45,87 +47,89 @@ THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFAdpXQI0gobiAo031YwBUpOU400JjQACrjgAAtuNYEloV73kP0r9tjgE",
 ]
 
-HELP_STICKER = "CAACAgIAAxkBAAAAAAA4"
+HELP_STICKER = "CAACAgIAAxkBAAAAAAA4"  # можно убрать
 
 # =========================
 # SYSTEM PROMPT
 # =========================
 SYSTEM_PROMPT = (
     "Ты дружелюбный, умный помощник. "
-    "Отвечай по-человечески, кратко и понятно."
+    "Отвечай живо, по-человечески, без воды."
 )
 
 # =========================
-# MEMORY + LOCKS
+# MEMORY + QUEUE
 # =========================
 user_memory = defaultdict(lambda: deque(maxlen=6))
 user_locks = defaultdict(asyncio.Lock)
-
-# =========================
-# OPENAI SAFE CALL
-# =========================
-def ask_gpt(messages):
-    return client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0.8,
-        max_tokens=700,
-        timeout=25,
-    )
 
 # =========================
 # HANDLERS
 # =========================
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
-    await message.answer("👋 Я жив. Пиши, помогу.")
+    await message.answer("👋 Я жив. Пиши — отвечу.")
 
 @dp.message_handler()
 async def chat(message: types.Message):
     user_id = message.from_user.id
 
-    async with user_locks[user_id]:
+    async with user_locks[user_id]:  # ⛔ очередь — 1 запрос за раз
         sticker_msg = None
 
         try:
             await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
 
+            # 🤔 thinking sticker
             sticker_msg = await bot.send_sticker(
                 message.chat.id,
                 random.choice(THINK_STICKERS)
             )
 
-            user_memory[user_id].append(
-                {"role": "user", "content": message.text}
-            )
+            # память
+            user_memory[user_id].append({
+                "role": "user",
+                "content": message.text
+            })
 
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(user_memory[user_id])
 
-            response = await asyncio.wait_for(
-                asyncio.to_thread(ask_gpt, messages),
-                timeout=30
+            # ⚠️ ВАЖНО: синхронный OpenAI → в executor
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=messages,
+                    temperature=0.8,
+                    max_tokens=700,
+                    timeout=30
+                )
             )
 
             answer = response.choices[0].message.content
 
-            user_memory[user_id].append(
-                {"role": "assistant", "content": answer}
-            )
+            user_memory[user_id].append({
+                "role": "assistant",
+                "content": answer
+            })
+
+            # 🧹 удалить thinking-стикер
+            if sticker_msg:
+                await bot.delete_message(
+                    message.chat.id,
+                    sticker_msg.message_id
+                )
 
             await message.answer(answer)
 
             if "спасибо" in message.text.lower():
                 await bot.send_sticker(message.chat.id, HELP_STICKER)
 
-        except asyncio.TimeoutError:
-            await message.answer("⌛ Я задумался дольше обычного. Напиши ещё раз.")
-
         except Exception as e:
-            logging.exception(e)
-            await message.answer("⚠️ Внутренняя ошибка. Попробуй ещё раз.")
+            logging.exception("❌ ERROR")
 
-        finally:
             if sticker_msg:
                 try:
                     await bot.delete_message(
@@ -135,24 +139,23 @@ async def chat(message: types.Message):
                 except:
                     pass
 
-# =========================
-# WEBHOOK + HEALTHCHECK
-# =========================
-async def healthcheck(request):
-    return web.Response(text="OK")
+            await message.answer("⚠️ Что-то пошло не так. Попробуй ещё раз.")
 
+# =========================
+# WEBHOOK
+# =========================
 async def on_startup(dp):
     await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"Webhook set: {WEBHOOK_URL}")
+    logging.info(f"✅ Webhook set: {WEBHOOK_URL}")
 
 async def on_shutdown(dp):
     await bot.delete_webhook()
     await bot.session.close()
 
+# =========================
+# START
+# =========================
 if __name__ == "__main__":
-    app = web.Application()
-    app.router.add_get("/", healthcheck)
-
     start_webhook(
         dispatcher=dp,
         webhook_path=WEBHOOK_PATH,
@@ -161,5 +164,4 @@ if __name__ == "__main__":
         skip_updates=True,
         host="0.0.0.0",
         port=PORT,
-        app=app,
     )
