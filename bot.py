@@ -17,14 +17,14 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://xxx.onrender.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://xxxx.onrender.com
 PORT = int(os.environ.get("PORT", 10000))
+
+if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_HOST:
+    raise RuntimeError("❌ Не заданы переменные окружения")
 
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-
-if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_HOST:
-    raise RuntimeError("❌ Проверь BOT_TOKEN / OPENAI_API_KEY / WEBHOOK_HOST")
 
 # =========================
 # LOGGING
@@ -39,7 +39,7 @@ dp = Dispatcher(bot)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# STICKERS (ЗАМЕНИ ПРИ ЖЕЛАНИИ)
+# STICKERS
 # =========================
 THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ",
@@ -47,14 +47,14 @@ THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFAdpXQI0gobiAo031YwBUpOU400JjQACrjgAAtuNYEloV73kP0r9tjgE",
 ]
 
-HELP_STICKER = "CAACAgIAAxkBAAAAAAA4"  # можно убрать
+HELP_STICKER = "CAACAgIAAxkBAAAAAAA4"
 
 # =========================
-# SYSTEM PROMPT
+# PROMPT
 # =========================
 SYSTEM_PROMPT = (
-    "Ты дружелюбный, умный помощник. "
-    "Отвечай живо, по-человечески, без воды."
+    "Ты дружелюбный и умный помощник. "
+    "Отвечай живо, по-человечески и понятно."
 )
 
 # =========================
@@ -68,25 +68,23 @@ user_locks = defaultdict(asyncio.Lock)
 # =========================
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
-    await message.answer("👋 Я жив. Пиши — отвечу.")
+    await message.answer("👋 Я на связи. Пиши.")
 
 @dp.message_handler()
 async def chat(message: types.Message):
     user_id = message.from_user.id
 
-    async with user_locks[user_id]:  # ⛔ очередь — 1 запрос за раз
+    async with user_locks[user_id]:
         sticker_msg = None
 
         try:
             await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
 
-            # 🤔 thinking sticker
             sticker_msg = await bot.send_sticker(
                 message.chat.id,
                 random.choice(THINK_STICKERS)
             )
 
-            # память
             user_memory[user_id].append({
                 "role": "user",
                 "content": message.text
@@ -95,7 +93,6 @@ async def chat(message: types.Message):
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(user_memory[user_id])
 
-            # ⚠️ ВАЖНО: синхронный OpenAI → в executor
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
@@ -103,8 +100,7 @@ async def chat(message: types.Message):
                     model="gpt-4o-mini",
                     messages=messages,
                     temperature=0.8,
-                    max_tokens=700,
-                    timeout=30
+                    max_tokens=600,
                 )
             )
 
@@ -115,7 +111,6 @@ async def chat(message: types.Message):
                 "content": answer
             })
 
-            # 🧹 удалить thinking-стикер
             if sticker_msg:
                 await bot.delete_message(
                     message.chat.id,
@@ -127,8 +122,8 @@ async def chat(message: types.Message):
             if "спасибо" in message.text.lower():
                 await bot.send_sticker(message.chat.id, HELP_STICKER)
 
-        except Exception as e:
-            logging.exception("❌ ERROR")
+        except Exception:
+            logging.exception("❌ Ошибка обработки")
 
             if sticker_msg:
                 try:
@@ -139,14 +134,14 @@ async def chat(message: types.Message):
                 except:
                     pass
 
-            await message.answer("⚠️ Что-то пошло не так. Попробуй ещё раз.")
+            await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
 
 # =========================
 # WEBHOOK
 # =========================
 async def on_startup(dp):
     await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"✅ Webhook set: {WEBHOOK_URL}")
+    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
 
 async def on_shutdown(dp):
     await bot.delete_webhook()
