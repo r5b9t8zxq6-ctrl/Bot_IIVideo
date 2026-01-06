@@ -2,8 +2,6 @@ import os
 import logging
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
 from openai import OpenAI
 
 # ---------- ENV ----------
@@ -23,94 +21,62 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot, storage=MemoryStorage())
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- STATES ----------
-class TextGen(StatesGroup):
-    topic = State()
-    style = State()
-    length = State()
+# ---------- MEMORY (диалог) ----------
+user_context = {}
 
-# ---------- KEYBOARDS ----------
-def main_menu():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🧠 Сгенерировать текст")
-    return kb
-
-def after_text_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🔄 Сгенерировать ещё")
-    kb.add("🏠 В меню")
-    return kb
+SYSTEM_PROMPT = (
+    "Ты дружелюбный, умный и полезный собеседник. "
+    "Отвечай понятно, живо и по делу."
+)
 
 # ---------- START ----------
 @dp.message_handler(commands=["start"])
 async def start(message: types.Message):
+    user_context[message.from_user.id] = [
+        {"role": "system", "content": SYSTEM_PROMPT}
+    ]
     await message.answer(
-        "Привет 👋\n\nЯ могу сгенерировать текст **на любую тему**.\n"
-        "Нажми кнопку ниже 👇",
-        reply_markup=main_menu()
+        "👋 Привет!\n\n"
+        "Я ИИ-собеседник.\n"
+        "Можешь писать **о чём угодно** — я отвечу 🙂"
     )
 
-# ---------- MENU ----------
-@dp.message_handler(lambda m: m.text == "🏠 В меню", state="*")
-async def back_to_menu(message: types.Message, state: FSMContext):
-    await state.finish()
-    await start(message)
+# ---------- CHAT ----------
+@dp.message_handler(content_types=types.ContentTypes.TEXT)
+async def chat(message: types.Message):
+    uid = message.from_user.id
 
-# ---------- START GENERATION ----------
-@dp.message_handler(lambda m: m.text in ["🧠 Сгенерировать текст", "🔄 Сгенерировать ещё"])
-async def ask_topic(message: types.Message):
-    await TextGen.topic.set()
-    await message.answer("📌 Напиши тему текста\n\nНапример:\n• мотивация\n• бизнес\n• отношения\n• философия")
-
-# ---------- TOPIC ----------
-@dp.message_handler(state=TextGen.topic)
-async def get_topic(message: types.Message, state: FSMContext):
-    await state.update_data(topic=message.text)
-    await TextGen.next()
-    await message.answer("🎭 В каком стиле писать?\n\nНапример:\n• жёстко\n• мотивационно\n• философски\n• иронично")
-
-# ---------- STYLE ----------
-@dp.message_handler(state=TextGen.style)
-async def get_style(message: types.Message, state: FSMContext):
-    await state.update_data(style=message.text)
-    await TextGen.next()
-    await message.answer("📏 Длина текста?\n\nНапример:\n• коротко\n• средне\n• длинно")
-
-# ---------- LENGTH + GENERATION ----------
-@dp.message_handler(state=TextGen.length)
-async def generate_text(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-
-    topic = data["topic"]
-    style = data["style"]
-    length = message.text
-
-    prompt = (
-        f"Сгенерируй текст на тему: {topic}.\n"
-        f"Стиль: {style}.\n"
-        f"Длина: {length}.\n\n"
-        "Текст должен быть живым, цепляющим и понятным."
-    )
-
-    await message.answer("⏳ Генерирую текст...")
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Ты профессиональный автор текстов."},
-            {"role": "user", "content": prompt}
+    if uid not in user_context:
+        user_context[uid] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
         ]
+
+    user_context[uid].append(
+        {"role": "user", "content": message.text}
     )
 
-    text = response.choices[0].message.content
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=user_context[uid],
+            temperature=0.8,
+        )
 
-    await message.answer(
-        f"✨ **Готово:**\n\n{text}",
-        reply_markup=after_text_kb(),
-        parse_mode="Markdown"
-    )
+        reply = response.choices[0].message.content
 
-    await state.finish()
+        user_context[uid].append(
+            {"role": "assistant", "content": reply}
+        )
+
+        # ограничиваем историю (чтобы не жрало токены)
+        if len(user_context[uid]) > 20:
+            user_context[uid] = user_context[uid][-20:]
+
+        await message.answer(reply)
+
+    except Exception as e:
+        logging.exception(e)
+        await message.answer("⚠️ Ошибка. Попробуй ещё раз позже.")
 
 # ---------- RUN ----------
 if __name__ == "__main__":
