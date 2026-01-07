@@ -79,25 +79,41 @@ async def start_cmd(message: Message):
 async def chat(message: Message):
     user_id = message.from_user.id
     text = message.text.strip()
+    text_lower = text.lower()
 
     async with user_locks[user_id]:
         await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
         try:
-            # ===== IMAGE MODE =====
-            if text.lower().startswith(("нарисуй", "создай изображение", "image:", "draw")):
+            # =========================
+            # IMAGE MODE (FORCED)
+            # =========================
+            image_triggers = [
+                "нарисуй",
+                "создай изображение",
+                "сделай изображение",
+                "картинку",
+                "изображение",
+                "image",
+                "draw",
+                "generate image",
+            ]
+
+            if any(trigger in text_lower for trigger in image_triggers):
                 async with openai_semaphore:
-                    img = await asyncio.to_thread(
+                    result = await asyncio.to_thread(
                         client.images.generate,
                         model="gpt-image-1",
                         prompt=text,
                         size="1024x1024"
                     )
 
-                await message.answer_photo(img.data[0].url)
+                await message.answer_photo(result.data[0].url)
                 return
 
-            # ===== CHAT MODE =====
+            # =========================
+            # CHAT MODE
+            # =========================
             user_memory[user_id].append({
                 "role": "user",
                 "content": text
@@ -128,10 +144,10 @@ async def chat(message: Message):
             await message.answer(answer)
 
         except asyncio.TimeoutError:
-            await message.answer("⏱ Я задумался слишком долго. Попробуй ещё раз.")
+            await message.answer("⏱ Слишком долго думаю. Попробуй ещё раз.")
         except Exception as e:
             logging.exception("Ошибка")
-            await message.answer("⚠️ Произошла ошибка. Попробуй ещё раз.")
+            await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
 
 # =========================
 # WEBHOOK
