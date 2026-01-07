@@ -1,131 +1,178 @@
-import asyncio
-import logging
 import os
+import logging
+import asyncio
+import random
+from collections import defaultdict, deque
 
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatAction
 from aiogram.filters import CommandStart
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from aiohttp import web
-from dotenv import load_dotenv
 from openai import OpenAI
 
-# ================== НАСТРОЙКИ ==================
-
-load_dotenv()
+# =========================
+# 🔍 ENV DIAGNOSTIC (CRITICAL)
+# =========================
+print("===== ENV CHECK =====")
+print("BOT_TOKEN =", os.getenv("BOT_TOKEN"))
+print("OPENAI_API_KEY =", os.getenv("OPENAI_API_KEY"))
+print("WEBHOOK_HOST =", os.getenv("WEBHOOK_HOST"))
+print("=====================")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxxx.onrender.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://xxxx.onrender.com
+PORT = int(os.getenv("PORT", 10000))
+
+if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_HOST:
+    raise RuntimeError("❌ Не заданы BOT_TOKEN / OPENAI_API_KEY / WEBHOOK_HOST")
+
 WEBHOOK_PATH = "/webhook"
-WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_URL:
-    raise RuntimeError("❌ Не заданы BOT_TOKEN / OPENAI_API_KEY / WEBHOOK_URL")
-
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(level=logging.INFO)
 
-# ================== ОБЪЕКТЫ ==================
-
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+# =========================
+# INIT
+# =========================
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# защита от одновременных запросов
-openai_semaphore = asyncio.Semaphore(2)
+# =========================
+# LIMITS
+# =========================
+OPENAI_TIMEOUT = 25
+OPENAI_CONCURRENCY = 1
+openai_semaphore = asyncio.Semaphore(OPENAI_CONCURRENCY)
 
-# ================== ХЭНДЛЕРЫ ==================
+# =========================
+# STICKERS
+# =========================
+THINK_STICKERS = [
+    "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ",
+    "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
+    "CAACAgIAAxkBAAEVFAdpXQI0gobiAo031YwBUpOU400JjQACrjgAAtuNYEloV73kP0r9tjgE",
+]
 
+# =========================
+# PROMPT
+# =========================
+SYSTEM_PROMPT = (
+    "Ты дружелюбный и умный помощник. "
+    "Отвечай живо, понятно и по-человечески."
+)
+
+# =========================
+# MEMORY + LOCKS
+# =========================
+user_memory = defaultdict(lambda: deque(maxlen=6))
+user_locks = defaultdict(asyncio.Lock)
+
+# =========================
+# HANDLERS
+# =========================
 @router.message(CommandStart())
-async def start_handler(message: Message):
-    await message.answer(
-        "👋 <b>Привет!</b>\n\n"
-        "Напиши:\n"
-        "• обычный текст — я отвечу\n"
-        "• <i>«нарисуй ...»</i> — я создам изображение 🎨"
-    )
+async def start(message: Message):
+    await message.answer("👋 Я онлайн. Пиши текст.")
 
+@router.message()
+async def chat(message: Message):
+    user_id = message.from_user.id
+    sticker_msg = None
 
-@router.message(F.text)
-async def message_handler(message: Message):
-    text = message.text.strip()
-    text_lower = text.lower()
+    async with user_locks[user_id]:
+        try:
+            await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    try:
-        # ---------- ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЯ ----------
-        image_triggers = (
-            "нарисуй",
-            "создай изображение",
-            "сделай изображение",
-            "картинку",
-            "изображение",
-            "draw",
-            "image",
-        )
-
-        if any(t in text_lower for t in image_triggers):
-            async with openai_semaphore:
-                result = await asyncio.to_thread(
-                    openai_client.images.generate,
-                    model="gpt-image-1",
-                    prompt=text,
-                    size="1024x1024",
-                )
-
-            image_url = result.data[0].url
-            await message.answer_photo(image_url)
-            return
-
-        # ---------- ГЕНЕРАЦИЯ ТЕКСТА ----------
-        async with openai_semaphore:
-            response = await asyncio.to_thread(
-                openai_client.chat.completions.create,
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Ты полезный Telegram-бот."},
-                    {"role": "user", "content": text},
-                ],
+            sticker_msg = await message.answer_sticker(
+                random.choice(THINK_STICKERS)
             )
 
-        reply = response.choices[0].message.content
-        await message.answer(reply)
+            user_memory[user_id].append({
+                "role": "user",
+                "content": message.text
+            })
 
-    except Exception as e:
-        logging.exception("Ошибка обработки сообщения")
-        await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages.extend(user_memory[user_id])
 
+            async with openai_semaphore:
+                loop = asyncio.get_running_loop()
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: openai_client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=messages,
+                            temperature=0.8,
+                            max_tokens=600,
+                        )
+                    ),
+                    timeout=OPENAI_TIMEOUT
+                )
 
-# ================== WEBHOOK ==================
+            answer = response.choices[0].message.content
 
-async def on_startup(app: web.Application):
-    await bot.set_webhook(WEBHOOK_FULL_URL)
-    logging.info(f"✅ Webhook установлен: {WEBHOOK_FULL_URL}")
+            user_memory[user_id].append({
+                "role": "assistant",
+                "content": answer
+            })
 
+            if sticker_msg:
+                await sticker_msg.delete()
 
-async def on_shutdown(app: web.Application):
+            await message.answer(answer)
+
+        except asyncio.TimeoutError:
+            if sticker_msg:
+                await sticker_msg.delete()
+            await message.answer("⏱ Я завис чуть дольше обычного. Напиши ещё раз.")
+
+        except Exception as e:
+            logging.exception("❌ Ошибка")
+            if sticker_msg:
+                try:
+                    await sticker_msg.delete()
+                except:
+                    pass
+            await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
+
+# =========================
+# WEBHOOK APP
+# =========================
+async def on_startup(app):
+    await bot.set_webhook(WEBHOOK_URL)
+    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
+
+async def on_shutdown(app):
     await bot.delete_webhook()
     await bot.session.close()
 
-
-async def handle_webhook(request: web.Request):
-    update = await request.json()
-    await dp.feed_raw_update(bot, update)
-    return web.Response(text="OK")
-
-
 def main():
     app = web.Application()
-    app.router.add_post(WEBHOOK_PATH, handle_webhook)
-
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    ).register(app, path=WEBHOOK_PATH)
 
+    setup_application(app, dp, bot=bot)
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
+# =========================
+# START
+# =========================
 if __name__ == "__main__":
     main()
