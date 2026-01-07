@@ -5,7 +5,7 @@ import asyncio
 from collections import defaultdict, deque
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ChatActions
+from aiogram.types import ChatActions, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.executor import start_webhook
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -17,7 +17,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://xxxx.onrender.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
 PORT = int(os.environ.get("PORT", 10000))
 
 if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_HOST:
@@ -39,10 +39,10 @@ dp = Dispatcher(bot)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# OPENAI LIMITS (CRITICAL)
+# LIMITS
 # =========================
-OPENAI_TIMEOUT = 25          # секунд
-OPENAI_CONCURRENCY = 1       # Render = 1 CPU
+OPENAI_TIMEOUT = 25
+OPENAI_CONCURRENCY = 1
 openai_semaphore = asyncio.Semaphore(OPENAI_CONCURRENCY)
 
 # =========================
@@ -54,28 +54,36 @@ THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFAdpXQI0gobiAo031YwBUpOU400JjQACrjgAAtuNYEloV73kP0r9tjgE",
 ]
 
-HELP_STICKER = "CAACAgIAAxkBAAAAAAA4"
-
 # =========================
 # PROMPT
 # =========================
 SYSTEM_PROMPT = (
     "Ты дружелюбный и умный помощник. "
-    "Отвечай живо, по-человечески и понятно."
+    "Отвечай живо и понятно."
 )
 
 # =========================
-# MEMORY + LOCKS
+# MEMORY
 # =========================
 user_memory = defaultdict(lambda: deque(maxlen=6))
 user_locks = defaultdict(asyncio.Lock)
+last_user_prompt = {}
+
+# =========================
+# KEYBOARD
+# =========================
+def generate_keyboard():
+    return InlineKeyboardMarkup(row_width=2).add(
+        InlineKeyboardButton("🖼 Сгенерировать изображение", callback_data="gen_image"),
+        InlineKeyboardButton("🎬 Сгенерировать видео", callback_data="gen_video"),
+    )
 
 # =========================
 # HANDLERS
 # =========================
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
-    await message.answer("👋 Я на связи. Пиши.")
+    await message.answer("👋 Напиши текст — я отвечу или сгенерирую изображение / видео.")
 
 @dp.message_handler()
 async def chat(message: types.Message):
@@ -84,25 +92,21 @@ async def chat(message: types.Message):
 
     async with user_locks[user_id]:
         try:
-            # typing
             await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
 
-            # thinking sticker
             sticker_msg = await bot.send_sticker(
-                message.chat.id,
-                random.choice(THINK_STICKERS)
+                message.chat.id, random.choice(THINK_STICKERS)
             )
 
-            # memory
-            user_memory[user_id].append({
-                "role": "user",
-                "content": message.text
-            })
+            last_user_prompt[user_id] = message.text
+
+            user_memory[user_id].append(
+                {"role": "user", "content": message.text}
+            )
 
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(user_memory[user_id])
 
-            # OpenAI (SAFE)
             async with openai_semaphore:
                 loop = asyncio.get_running_loop()
                 response = await asyncio.wait_for(
@@ -112,56 +116,73 @@ async def chat(message: types.Message):
                             model="gpt-4o-mini",
                             messages=messages,
                             temperature=0.8,
-                            max_tokens=600,
+                            max_tokens=400,
                         )
                     ),
                     timeout=OPENAI_TIMEOUT
                 )
 
             answer = response.choices[0].message.content
+            user_memory[user_id].append(
+                {"role": "assistant", "content": answer}
+            )
 
-            user_memory[user_id].append({
-                "role": "assistant",
-                "content": answer
-            })
+            await bot.delete_message(message.chat.id, sticker_msg.message_id)
 
-            # delete sticker
-            if sticker_msg:
-                await bot.delete_message(
-                    message.chat.id,
-                    sticker_msg.message_id
-                )
-
-            await message.answer(answer)
-
-            if "спасибо" in message.text.lower():
-                await bot.send_sticker(message.chat.id, HELP_STICKER)
-
-        except asyncio.TimeoutError:
-            logging.warning("⏱ OpenAI timeout")
-
-            if sticker_msg:
-                await bot.delete_message(message.chat.id, sticker_msg.message_id)
-
-            await message.answer("⏱ Я задумался слишком долго. Попробуй ещё раз.")
+            await message.answer(
+                answer,
+                reply_markup=generate_keyboard()
+            )
 
         except Exception:
-            logging.exception("❌ Ошибка")
-
+            logging.exception("Ошибка")
             if sticker_msg:
-                try:
-                    await bot.delete_message(message.chat.id, sticker_msg.message_id)
-                except:
-                    pass
-
+                await bot.delete_message(message.chat.id, sticker_msg.message_id)
             await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
+
+# =========================
+# IMAGE GENERATION
+# =========================
+@dp.callback_query_handler(lambda c: c.data == "gen_image")
+async def generate_image(call: types.CallbackQuery):
+    prompt = last_user_prompt.get(call.from_user.id)
+    if not prompt:
+        await call.answer("Нет текста для генерации", show_alert=True)
+        return
+
+    await call.message.answer("🖼 Генерирую изображение...")
+    await call.answer()
+
+    async with openai_semaphore:
+        image = client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            size="1024x1024"
+        )
+
+    await bot.send_photo(
+        call.message.chat.id,
+        image.data[0].url,
+        caption=f"🖼 {prompt}"
+    )
+
+# =========================
+# VIDEO (ЗАГЛУШКА)
+# =========================
+@dp.callback_query_handler(lambda c: c.data == "gen_video")
+async def generate_video(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(
+        "🎬 Генерация видео скоро будет доступна.\n"
+        "Планируется подключение Runway / Pika / Kling."
+    )
 
 # =========================
 # WEBHOOK
 # =========================
 async def on_startup(dp):
     await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
+    logging.info(f"Webhook set: {WEBHOOK_URL}")
 
 async def on_shutdown(dp):
     await bot.delete_webhook()
