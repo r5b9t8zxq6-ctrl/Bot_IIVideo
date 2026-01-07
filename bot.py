@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import random
-from collections import defaultdict, deque
+import base64
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
@@ -12,13 +12,8 @@ from aiogram.types import (
     CallbackQuery,
     Update,
 )
-from aiogram.enums import ChatAction
 from dotenv import load_dotenv
-
 from aiohttp import web, ClientSession, ClientTimeout
-
-from openai import OpenAI
-import replicate
 
 # =========================
 # ENV
@@ -26,10 +21,7 @@ import replicate
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")          # https://your-domain/webhook
-VERCEL_IMAGE_API = os.getenv("VERCEL_IMAGE_API")  # https://xxx.vercel.app/api/image
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-domain/webhook
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     raise RuntimeError("BOT_TOKEN или WEBHOOK_URL не заданы")
@@ -44,20 +36,12 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
-
-user_mode = defaultdict(lambda: "text")
-user_memory = defaultdict(lambda: deque(maxlen=6))
-user_locks = defaultdict(asyncio.Lock)
+user_mode = {}
 
 THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ",
     "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
 ]
-
-SDXL_MODEL = "stability-ai/sdxl"
-SYSTEM_PROMPT = "Ты дружелюбный ассистент. Отвечай кратко и по делу."
 
 # =========================
 # KEYBOARD
@@ -67,8 +51,7 @@ def main_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="💬 Текст", callback_data="mode_text"),
-                InlineKeyboardButton(text="🖼 Replicate", callback_data="mode_image"),
-                InlineKeyboardButton(text="⚡ Vercel", callback_data="mode_vercel"),
+                InlineKeyboardButton(text="🖼 Craiyon", callback_data="mode_image"),
             ]
         ]
     )
@@ -78,9 +61,10 @@ def main_keyboard():
 # =========================
 @router.message(F.text == "/start")
 async def start_cmd(message: Message):
+    user_mode[message.from_user.id] = "text"
     await message.answer(
-        "Привет 👋\nВыбери режим:",
-        reply_markup=main_keyboard()
+        "Привет 👋\nЯ могу бесплатно генерировать изображения через Craiyon.\n\nВыбери режим:",
+        reply_markup=main_keyboard(),
     )
 
 # =========================
@@ -93,123 +77,63 @@ async def mode_switch(cb: CallbackQuery):
 
     titles = {
         "text": "💬 Режим текста",
-        "image": "🖼 Генерация через Replicate",
-        "vercel": "⚡ Генерация через Vercel",
+        "image": "🖼 Генерация изображений (Craiyon)",
     }
 
     await cb.message.answer(titles.get(mode, "Режим изменён"))
     await cb.answer()
 
 # =========================
+# CRAIYON GENERATION
+# =========================
+async def generate_craiyon(prompt: str) -> list[bytes]:
+    url = "https://backend.craiyon.com/generate"
+    payload = {"prompt": prompt}
+
+    async with ClientSession(timeout=ClientTimeout(total=120)) as session:
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                raise RuntimeError("Craiyon API error")
+
+            data = await resp.json()
+            images = data.get("images", [])
+
+            return [base64.b64decode(img) for img in images]
+
+# =========================
 # MESSAGE HANDLER
 # =========================
 @router.message(F.text)
 async def handle_message(message: Message):
-    user_id = message.from_user.id
-    mode = user_mode[user_id]
+    mode = user_mode.get(message.from_user.id, "text")
 
-    # ================= IMAGE (REPLICATE) =================
     if mode == "image":
         thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
+
         try:
-            loop = asyncio.get_running_loop()
+            images = await generate_craiyon(message.text)
 
-            output = await loop.run_in_executor(
-                None,
-                lambda: replicate_client.run(
-                    SDXL_MODEL,
-                    input={
-                        "prompt": message.text,
-                        "width": 1024,
-                        "height": 1024,
-                        "num_outputs": 1,
-                        "guidance_scale": 7.5,
-                        "num_inference_steps": 30,
-                    },
-                ),
-            )
+            if not images:
+                await message.answer("❌ Не удалось сгенерировать изображение")
+                return
 
-            await message.answer_photo(output[0], caption=message.text)
+            # Отправляем первые 3 картинки
+            for img in images[:3]:
+                await message.answer_photo(img)
 
         except Exception:
-            logging.exception("REPLICATE ERROR")
-            await message.answer("❌ Ошибка генерации через Replicate")
+            logging.exception("CRAIYON ERROR")
+            await message.answer("❌ Ошибка генерации через Craiyon")
 
         finally:
             await thinking.delete()
         return
 
-    # ================= IMAGE (VERCEL) =================
-    if mode == "vercel":
-        thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
-        try:
-            async with ClientSession(timeout=ClientTimeout(total=90)) as session:
-                async with session.post(
-                    VERCEL_IMAGE_API,
-                    json={"prompt": message.text},
-                ) as resp:
-
-                    content_type = resp.headers.get("Content-Type", "")
-
-                    if "image" in content_type:
-                        image_bytes = await resp.read()
-                        await message.answer_photo(image_bytes, caption=message.text)
-                        return
-
-                    if "application/json" in content_type:
-                        data = await resp.json()
-
-                        if "image_url" in data:
-                            await message.answer_photo(data["image_url"], caption=message.text)
-                            return
-
-                        if "base64" in data:
-                            import base64
-                            image_bytes = base64.b64decode(data["base64"])
-                            await message.answer_photo(image_bytes, caption=message.text)
-                            return
-
-                        raise RuntimeError(data)
-
-                    raise RuntimeError(await resp.text())
-
-        except Exception:
-            logging.exception("VERCEL ERROR")
-            await message.answer("❌ Ошибка генерации через Vercel")
-
-        finally:
-            await thinking.delete()
-        return
-
-    # ================= TEXT =================
-    async with user_locks[user_id]:
-        thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
-        try:
-            await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-            user_memory[user_id].append({"role": "user", "content": message.text})
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            messages.extend(user_memory[user_id])
-
-            response = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=messages,
-                    max_tokens=500,
-                ),
-            )
-
-            answer = response.choices[0].message.content
-            user_memory[user_id].append({"role": "assistant", "content": answer})
-            await message.answer(answer)
-
-        except Exception:
-            logging.exception("CHAT ERROR")
-            await message.answer("Ошибка ответа")
-
-        finally:
-            await thinking.delete()
+    # TEXT MODE
+    await message.answer(
+        "💬 Текстовый режим\n\n"
+        "Переключись на 🖼 Craiyon, чтобы генерировать изображения бесплатно."
+    )
 
 # =========================
 # WEBHOOK SERVER
@@ -241,4 +165,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
