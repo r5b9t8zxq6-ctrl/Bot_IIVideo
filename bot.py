@@ -5,11 +5,7 @@ import random
 from collections import defaultdict, deque
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ChatAction
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
@@ -27,10 +23,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://xxxx.onrender.com
-PORT = int(os.environ.get("PORT", 10000))
+PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN or not WEBHOOK_HOST:
-    raise RuntimeError("❌ Не заданы BOT_TOKEN или WEBHOOK_HOST")
+    raise RuntimeError("❌ BOT_TOKEN или WEBHOOK_HOST не заданы")
 
 # =========================
 # CONFIG
@@ -38,18 +34,17 @@ if not BOT_TOKEN or not WEBHOOK_HOST:
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-OPENAI_TIMEOUT = 25
-OPENAI_CONCURRENCY = 1
-
 SYSTEM_PROMPT = (
     "Ты умный, дружелюбный ассистент. "
-    "Отвечай кратко, по делу и по-человечески."
+    "Отвечай кратко и по делу."
 )
 
 THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ",
     "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
 ]
+
+SDXL_MODEL = "stability-ai/sdxl:2b017d6b1d8f8a3a3c3c9cddc9c9b5f3c8c5e0e8c1a8d5e3f7b0c6f0a5"
 
 # =========================
 # INIT
@@ -64,8 +59,7 @@ dp.include_router(router)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-openai_semaphore = asyncio.Semaphore(OPENAI_CONCURRENCY)
-
+user_mode = defaultdict(lambda: "text")
 user_memory = defaultdict(lambda: deque(maxlen=6))
 user_locks = defaultdict(asyncio.Lock)
 
@@ -73,14 +67,14 @@ user_locks = defaultdict(asyncio.Lock)
 # KEYBOARD
 # =========================
 def main_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="💬 Текст", callback_data="mode_text"),
-            InlineKeyboardButton(text="🖼 Картинка", callback_data="mode_image"),
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💬 Текст", callback_data="mode_text"),
+                InlineKeyboardButton(text="🖼 Картинка", callback_data="mode_image"),
+            ]
         ]
-    ])
-
-user_mode = defaultdict(lambda: "text")
+    )
 
 # =========================
 # START
@@ -89,9 +83,6 @@ user_mode = defaultdict(lambda: "text")
 async def start_cmd(message: Message):
     await message.answer(
         "👋 Привет!\n\n"
-        "Я умею:\n"
-        "💬 Отвечать на вопросы\n"
-        "🖼 Генерировать изображения\n\n"
         "Выбери режим 👇",
         reply_markup=main_keyboard()
     )
@@ -104,41 +95,52 @@ async def mode_switch(callback):
     mode = callback.data.replace("mode_", "")
     user_mode[callback.from_user.id] = mode
 
-    text = "💬 Режим текста" if mode == "text" else "🖼 Режим генерации изображений"
-    await callback.message.answer(text)
+    await callback.message.answer(
+        "💬 Режим текста" if mode == "text" else "🖼 Режим генерации изображений"
+    )
     await callback.answer()
 
 # =========================
 # IMAGE GENERATION
 # =========================
+async def generate_image(prompt: str) -> str:
+    loop = asyncio.get_running_loop()
+
+    output = await loop.run_in_executor(
+        None,
+        lambda: replicate_client.run(
+            SDXL_MODEL,
+            input={
+                "prompt": prompt,
+                "width": 1024,
+                "height": 1024,
+                "num_outputs": 1,
+            }
+        )
+    )
+
+    if isinstance(output, list) and output:
+        return output[0]
+
+    if isinstance(output, str) and output.startswith("http"):
+        return output
+
+    raise ValueError("Replicate не вернул изображение")
+
 @router.message(F.text & (lambda m: user_mode[m.from_user.id] == "image"))
 async def image_handler(message: Message):
-    prompt = message.text.strip()
-
     thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
 
     try:
-        output = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: replicate_client.run(
-                "stability-ai/sdxl",
-                input={
-                    "prompt": prompt,
-                    "width": 1024,
-                    "height": 1024,
-                    "num_outputs": 1,
-                }
-            )
-        )
-
-        image_url = output[0]
+        image_url = await generate_image(message.text)
 
         await message.answer_photo(
             photo=image_url,
-            caption=f"🖼 {prompt}"
+            caption=f"🖼 {message.text}"
         )
 
     except Exception:
+        logging.exception("IMAGE ERROR")
         await message.answer("⚠️ Ошибка генерации изображения")
 
     finally:
@@ -152,50 +154,41 @@ async def chat_handler(message: Message):
     user_id = message.from_user.id
 
     async with user_locks[user_id]:
-        thinking = None
+        thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
         try:
             await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-            thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
 
-            user_memory[user_id].append({
-                "role": "user",
-                "content": message.text
-            })
+            user_memory[user_id].append(
+                {"role": "user", "content": message.text}
+            )
 
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(user_memory[user_id])
 
-            async with openai_semaphore:
-                response = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(
-                        None,
-                        lambda: openai_client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=messages,
-                            max_tokens=600,
-                            temperature=0.8,
-                        )
-                    ),
-                    timeout=OPENAI_TIMEOUT
+            response = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=messages,
+                    max_tokens=500,
+                    temperature=0.8,
                 )
+            )
 
             answer = response.choices[0].message.content
 
-            user_memory[user_id].append({
-                "role": "assistant",
-                "content": answer
-            })
+            user_memory[user_id].append(
+                {"role": "assistant", "content": answer}
+            )
 
             await message.answer(answer)
 
-        except asyncio.TimeoutError:
-            await message.answer("⏱ Я задумался слишком долго. Попробуй ещё раз.")
         except Exception:
             logging.exception("CHAT ERROR")
-            await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
+            await message.answer("⚠️ Ошибка ответа")
+
         finally:
-            if thinking:
-                await thinking.delete()
+            await thinking.delete()
 
 # =========================
 # WEBHOOK
@@ -227,8 +220,6 @@ setup_application(
 )
 
 if __name__ == "__main__":
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=PORT
-    )
+    web.run_app(app, host="0.0.0.0", port=PORT)
+
+    
