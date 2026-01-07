@@ -9,17 +9,25 @@ from aiogram.types import Message, BufferedInputFile
 from aiogram.filters import CommandStart
 
 from openai import OpenAI
-from dotenv import load_dotenv
 
 # ================== ENV ==================
-load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-if not all([BOT_TOKEN, OPENAI_API_KEY, WEBHOOK_URL]):
-    raise RuntimeError("❌ Не заданы BOT_TOKEN / OPENAI_API_KEY / WEBHOOK_URL")
+# принимаем ЛЮБОЙ вариант
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
+
+if not WEBHOOK_URL and WEBHOOK_HOST:
+    WEBHOOK_URL = WEBHOOK_HOST.rstrip("/") + "/webhook"
+
+if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_URL:
+    raise RuntimeError(
+        f"❌ ENV error:\n"
+        f"BOT_TOKEN={bool(BOT_TOKEN)}\n"
+        f"OPENAI_API_KEY={bool(OPENAI_API_KEY)}\n"
+        f"WEBHOOK_URL={WEBHOOK_URL}"
+    )
 
 # ================== LOG ==================
 logging.basicConfig(level=logging.INFO)
@@ -30,53 +38,49 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+openai = OpenAI(api_key=OPENAI_API_KEY)
 
 # ================== START ==================
 @router.message(CommandStart())
 async def start(message: Message):
     await message.answer(
-        "👋 Напиши текст — я отвечу.\n\n"
-        "🖼 Чтобы создать изображение, начни сообщение с:\n"
-        "`/img описание картинки`",
+        "👋 Я работаю.\n\n"
+        "🖼 Генерация изображений:\n"
+        "`/img описание`",
         parse_mode="Markdown"
     )
 
 # ================== IMAGE ==================
 @router.message(lambda m: m.text and m.text.startswith("/img"))
-async def generate_image(message: Message):
+async def image(message: Message):
     prompt = message.text.replace("/img", "", 1).strip()
 
     if not prompt:
-        await message.answer("❗️ Напиши описание после `/img`")
+        await message.answer("❗️Напиши описание после /img")
         return
 
-    await message.answer("🎨 Генерирую изображение...")
+    wait_msg = await message.answer("🎨 Генерирую изображение...")
 
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: openai_client.images.generate(
+            lambda: openai.images.generate(
                 model="gpt-image-1",
                 prompt=prompt,
                 size="1024x1024"
             )
         )
 
-        image_base64 = result.data[0].b64_json
-        image_bytes = base64.b64decode(image_base64)
+        img_bytes = base64.b64decode(result.data[0].b64_json)
+        photo = BufferedInputFile(img_bytes, "image.png")
 
-        photo = BufferedInputFile(
-            image_bytes,
-            filename="image.png"
-        )
-
+        await wait_msg.delete()
         await message.answer_photo(photo, caption="🖼 Готово")
 
     except Exception:
-        logging.exception("Ошибка генерации изображения")
-        await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
+        logging.exception("IMAGE ERROR")
+        await wait_msg.edit_text("⚠️ Ошибка генерации")
 
 # ================== TEXT ==================
 @router.message(lambda m: m.text)
@@ -85,21 +89,19 @@ async def chat(message: Message):
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: openai_client.chat.completions.create(
+            lambda: openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "Ты полезный ассистент."},
+                    {"role": "system", "content": "Ты дружелюбный ассистент."},
                     {"role": "user", "content": message.text}
-                ],
-                temperature=0.7
+                ]
             )
         )
-
         await message.answer(response.choices[0].message.content)
 
     except Exception:
-        logging.exception("Ошибка генерации текста")
-        await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
+        logging.exception("CHAT ERROR")
+        await message.answer("⚠️ Ошибка")
 
 # ================== WEBHOOK ==================
 async def on_startup(app: web.Application):
