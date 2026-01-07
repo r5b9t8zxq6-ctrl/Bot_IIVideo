@@ -211,11 +211,24 @@ async def on_shutdown(bot: Bot):
 # =========================
 # APP
 # =========================
-async def main():
-    app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot, on_startup=on_startup, on_shutdown=on_shutdown)
-    web.run_app(app, host="0.0.0.0", port=PORT)
+app = web.Application()
+
+SimpleRequestHandler(
+    dispatcher=dp,
+    bot=bot,
+).register(app, path=WEBHOOK_PATH)
+
+setup_application(
+    app,
+    dp,
+    bot=bot,
+    on_startup=on_startup,
+    on_shutdown=on_shutdown,
+)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=PORT
+    )
