@@ -2,15 +2,10 @@ import os
 import asyncio
 import logging
 import random
-from collections import defaultdict, deque
+from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-)
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ChatAction
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
@@ -25,31 +20,14 @@ import replicate
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://xxxx.onrender.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
 PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN or not WEBHOOK_HOST:
-    raise RuntimeError("❌ BOT_TOKEN или WEBHOOK_HOST не заданы")
+    raise RuntimeError("ENV не заданы")
 
-# =========================
-# CONFIG
-# =========================
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-
-SYSTEM_PROMPT = (
-    "Ты умный, дружелюбный ассистент. "
-    "Отвечай кратко, по делу и по-человечески."
-)
-
-THINK_STICKERS = [
-    "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ",
-    "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
-]
-
-SDXL_MODEL = "stability-ai/sdxl"
 
 # =========================
 # INIT
@@ -61,196 +39,80 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
+openai_client = OpenAI()
+replicate_client = replicate.Client()
 
 user_mode = defaultdict(lambda: "text")
-user_memory = defaultdict(lambda: deque(maxlen=6))
-user_locks = defaultdict(asyncio.Lock)
+
+THINK_STICKER = "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ"
 
 # =========================
-# KEYBOARDS
+# KEYBOARD
 # =========================
-def main_keyboard():
+def keyboard():
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="💬 Текст", callback_data="mode_text"),
-                InlineKeyboardButton(text="🖼 Картинка", callback_data="mode_image"),
-            ]
-        ]
-    )
-
-def image_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔄 Сгенерировать ещё",
-                    callback_data="image_again"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💬 Вернуться к тексту",
-                    callback_data="mode_text"
-                )
-            ]
-        ]
+        inline_keyboard=[[
+            InlineKeyboardButton(text="💬 Текст", callback_data="text"),
+            InlineKeyboardButton(text="🖼 Картинка", callback_data="image"),
+        ]]
     )
 
 # =========================
 # START
 # =========================
 @router.message(F.text == "/start")
-async def start_cmd(message: Message):
-    await message.answer(
-        "👋 Привет!\n\n"
-        "Я умею:\n"
-        "💬 Общаться\n"
-        "🖼 Генерировать изображения\n\n"
-        "Выбери режим 👇",
-        reply_markup=main_keyboard()
-    )
+async def start(message: Message):
+    await message.answer("Выбери режим 👇", reply_markup=keyboard())
+
+@router.callback_query()
+async def mode(cb):
+    user_mode[cb.from_user.id] = cb.data
+    await cb.message.answer("Режим изменён")
+    await cb.answer()
 
 # =========================
-# MODE SWITCH
-# =========================
-@router.callback_query(F.data.startswith("mode_"))
-async def mode_switch(callback: CallbackQuery):
-    mode = callback.data.replace("mode_", "")
-    user_mode[callback.from_user.id] = mode
-
-    await callback.message.answer(
-        "💬 Режим текста" if mode == "text" else "🖼 Режим генерации изображений"
-    )
-    await callback.answer()
-
-# =========================
-# IMAGE AGAIN
-# =========================
-@router.callback_query(F.data == "image_again")
-async def image_again(callback: CallbackQuery):
-    user_mode[callback.from_user.id] = "image"
-    await callback.message.answer("🖼 Напиши новый запрос для изображения")
-    await callback.answer()
-
-# =========================
-# IMAGE GENERATION
-# =========================
-async def generate_image(prompt: str) -> str:
-    loop = asyncio.get_running_loop()
-
-    output = await loop.run_in_executor(
-        None,
-        lambda: replicate_client.run(
-            SDXL_MODEL,
-            input={
-                "prompt": prompt,
-                "width": 1024,
-                "height": 1024,
-                "num_outputs": 1,
-            }
-        )
-    )
-
-    if isinstance(output, list) and output:
-        return output[0]
-
-    raise ValueError("Replicate не вернул изображение")
-
-@router.message(F.text & (lambda m: user_mode[m.from_user.id] == "image"))
-async def image_handler(message: Message):
-    thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
-
-    try:
-        image_url = await generate_image(message.text)
-
-        await message.answer_photo(
-            photo=image_url,
-            caption=f"🖼 {message.text}",
-            reply_markup=image_keyboard()
-        )
-
-    except Exception:
-        logging.exception("IMAGE ERROR")
-        await message.answer("⚠️ Ошибка генерации изображения")
-
-    finally:
-        await thinking.delete()
-
-# =========================
-# TEXT CHAT
+# MAIN
 # =========================
 @router.message(F.text)
-async def chat_handler(message: Message):
-    user_id = message.from_user.id
-
-    async with user_locks[user_id]:
-        thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
+async def handler(message: Message):
+    if user_mode[message.from_user.id] == "image":
+        sticker = await message.answer_sticker(THINK_STICKER)
         try:
-            await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-            user_memory[user_id].append(
-                {"role": "user", "content": message.text}
-            )
-
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            messages.extend(user_memory[user_id])
-
-            response = await asyncio.get_running_loop().run_in_executor(
+            out = await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda: openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=messages,
-                    max_tokens=500,
-                    temperature=0.8,
+                lambda: replicate_client.run(
+                    "stability-ai/sdxl",
+                    input={"prompt": message.text}
                 )
             )
-
-            answer = response.choices[0].message.content
-
-            user_memory[user_id].append(
-                {"role": "assistant", "content": answer}
-            )
-
-            await message.answer(answer)
-
+            await message.answer_photo(out[0])
         except Exception:
-            logging.exception("CHAT ERROR")
-            await message.answer("⚠️ Ошибка ответа")
-
+            await message.answer("Ошибка генерации")
         finally:
-            await thinking.delete()
+            await sticker.delete()
+        return
+
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    res = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": message.text}]
+    )
+    await message.answer(res.choices[0].message.content)
 
 # =========================
 # WEBHOOK
 # =========================
 async def on_startup(bot: Bot):
     await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
+    logging.info(f"Webhook установлен: {WEBHOOK_URL}")
 
 async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
-    await bot.session.close()
 
-# =========================
-# APP
-# =========================
 app = web.Application()
 
-SimpleRequestHandler(
-    dispatcher=dp,
-    bot=bot,
-).register(app, path=WEBHOOK_PATH)
-
-setup_application(
-    app,
-    dp,
-    bot=bot,
-    on_startup=on_startup,
-    on_shutdown=on_shutdown,
-)
+SimpleRequestHandler(dp, bot).register(app, path=WEBHOOK_PATH)
+setup_application(app, dp, bot=bot, on_startup=on_startup, on_shutdown=on_shutdown)
 
 if __name__ == "__main__":
     web.run_app(app, host="0.0.0.0", port=PORT)
