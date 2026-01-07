@@ -13,10 +13,9 @@ from aiogram.types import (
     Update,
 )
 from aiogram.enums import ChatAction
-from aiogram.filters import CommandStart
 from dotenv import load_dotenv
 
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout
 
 from openai import OpenAI
 import replicate
@@ -30,6 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+VERCEL_IMAGE_API = os.getenv("VERCEL_IMAGE_API")
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     raise RuntimeError("BOT_TOKEN или WEBHOOK_URL не заданы")
@@ -56,7 +56,7 @@ THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
 ]
 
-SDXL_MODEL = "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7d1f7c2e0faeb1d6a9b0c2e4f4a3d"
+SDXL_MODEL = "stability-ai/sdxl"
 SYSTEM_PROMPT = "Ты дружелюбный ассистент. Отвечай кратко и по делу."
 
 # =========================
@@ -67,15 +67,18 @@ def main_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="💬 Текст", callback_data="mode_text"),
-                InlineKeyboardButton(text="🖼 Картинка", callback_data="mode_image"),
-            ]
+            ],
+            [
+                InlineKeyboardButton(text="🖼 Replicate", callback_data="mode_image"),
+                InlineKeyboardButton(text="⚡ Vercel", callback_data="mode_vercel"),
+            ],
         ]
     )
 
 # =========================
 # START
 # =========================
-@router.message(CommandStart())
+@router.message(F.text == "/start")
 async def start_cmd(message: Message):
     await message.answer("Привет 👋\nВыбери режим:", reply_markup=main_keyboard())
 
@@ -86,9 +89,14 @@ async def start_cmd(message: Message):
 async def mode_switch(cb: CallbackQuery):
     mode = cb.data.replace("mode_", "")
     user_mode[cb.from_user.id] = mode
-    await cb.message.answer(
-        "💬 Режим текста" if mode == "text" else "🖼 Режим генерации изображений"
-    )
+
+    text = {
+        "text": "💬 Режим текста",
+        "image": "🖼 Генерация через Replicate",
+        "vercel": "⚡ Генерация через Vercel",
+    }.get(mode, "Режим изменён")
+
+    await cb.message.answer(text)
     await cb.answer()
 
 # =========================
@@ -99,11 +107,12 @@ async def handle_message(message: Message):
     user_id = message.from_user.id
     mode = user_mode[user_id]
 
-    # ================= IMAGE MODE =================
+    # ===== IMAGE: REPLICATE =====
     if mode == "image":
         thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
         try:
             loop = asyncio.get_running_loop()
+
             output = await loop.run_in_executor(
                 None,
                 lambda: replicate_client.run(
@@ -113,25 +122,43 @@ async def handle_message(message: Message):
                         "width": 1024,
                         "height": 1024,
                         "num_outputs": 1,
-                        "guidance_scale": 7.5,
-                        "num_inference_steps": 30,
                     },
                 ),
             )
+
             await message.answer_photo(output[0], caption=message.text)
 
         except Exception:
-            logging.exception("IMAGE ERROR")
-            await message.answer(
-                "❌ Ошибка генерации изображения.\n"
-                "⏳ Возможно лимит Replicate. Подожди 10–15 секунд."
-            )
+            logging.exception("REPLICATE ERROR")
+            await message.answer("❌ Ошибка генерации изображения (Replicate)")
         finally:
             await thinking.delete()
+        return
 
-        return  # ← ВАЖНО: выходим после image
+    # ===== IMAGE: VERCEL =====
+    if mode == "vercel":
+        thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=60)) as session:
+                async with session.post(
+                    VERCEL_IMAGE_API,
+                    json={"prompt": message.text},
+                ) as resp:
+                    data = await resp.json()
 
-    # ================= TEXT MODE =================
+            if "image_url" not in data:
+                raise RuntimeError("Нет image_url")
+
+            await message.answer_photo(data["image_url"], caption=message.text)
+
+        except Exception:
+            logging.exception("VERCEL ERROR")
+            await message.answer("❌ Ошибка генерации через Vercel")
+        finally:
+            await thinking.delete()
+        return
+
+    # ===== TEXT MODE =====
     async with user_locks[user_id]:
         thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
         try:
@@ -157,12 +184,12 @@ async def handle_message(message: Message):
             user_memory[user_id].append(
                 {"role": "assistant", "content": answer}
             )
+
             await message.answer(answer)
 
         except Exception:
             logging.exception("CHAT ERROR")
             await message.answer("❌ Ошибка ответа")
-
         finally:
             await thinking.delete()
 
@@ -187,11 +214,7 @@ def main():
     app.router.add_post("/webhook", handle_webhook)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-    )
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
 
 if __name__ == "__main__":
     main()
