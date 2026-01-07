@@ -2,7 +2,8 @@ import os
 import asyncio
 import logging
 import random
-import base64
+import urllib.parse
+from collections import defaultdict, deque
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
@@ -12,8 +13,11 @@ from aiogram.types import (
     CallbackQuery,
     Update,
 )
+from aiogram.enums import ChatAction
 from dotenv import load_dotenv
-from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp import web
+
+from openai import OpenAI
 
 # =========================
 # ENV
@@ -21,7 +25,8 @@ from aiohttp import web, ClientSession, ClientTimeout
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-domain/webhook
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     raise RuntimeError("BOT_TOKEN или WEBHOOK_URL не заданы")
@@ -36,12 +41,18 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-user_mode = {}
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+user_mode = defaultdict(lambda: "text")
+user_memory = defaultdict(lambda: deque(maxlen=6))
+user_locks = defaultdict(asyncio.Lock)
 
 THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ",
     "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
 ]
+
+SYSTEM_PROMPT = "Ты дружелюбный ассистент. Отвечай кратко и по делу."
 
 # =========================
 # KEYBOARD
@@ -51,21 +62,24 @@ def main_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="💬 Текст", callback_data="mode_text"),
-                InlineKeyboardButton(text="🖼 Craiyon", callback_data="mode_image"),
+                InlineKeyboardButton(text="🖼 Картинка", callback_data="mode_image"),
             ]
         ]
     )
+
+# =========================
+# POLLINATIONS
+# =========================
+def pollinations_image_url(prompt: str) -> str:
+    q = urllib.parse.quote(prompt)
+    return f"https://image.pollinations.ai/prompt/{q}?width=1024&height=1024&seed={random.randint(1, 999999)}"
 
 # =========================
 # START
 # =========================
 @router.message(F.text == "/start")
 async def start_cmd(message: Message):
-    user_mode[message.from_user.id] = "text"
-    await message.answer(
-        "Привет 👋\nЯ могу бесплатно генерировать изображения через Craiyon.\n\nВыбери режим:",
-        reply_markup=main_keyboard(),
-    )
+    await message.answer("Привет 👋\nВыбери режим:", reply_markup=main_keyboard())
 
 # =========================
 # MODE SWITCH
@@ -74,66 +88,67 @@ async def start_cmd(message: Message):
 async def mode_switch(cb: CallbackQuery):
     mode = cb.data.replace("mode_", "")
     user_mode[cb.from_user.id] = mode
-
-    titles = {
-        "text": "💬 Режим текста",
-        "image": "🖼 Генерация изображений (Craiyon)",
-    }
-
-    await cb.message.answer(titles.get(mode, "Режим изменён"))
+    await cb.message.answer(
+        "💬 Режим текста" if mode == "text" else "🖼 Режим генерации изображений"
+    )
     await cb.answer()
-
-# =========================
-# CRAIYON GENERATION
-# =========================
-async def generate_craiyon(prompt: str) -> list[bytes]:
-    url = "https://backend.craiyon.com/generate"
-    payload = {"prompt": prompt}
-
-    async with ClientSession(timeout=ClientTimeout(total=120)) as session:
-        async with session.post(url, json=payload) as resp:
-            if resp.status != 200:
-                raise RuntimeError("Craiyon API error")
-
-            data = await resp.json()
-            images = data.get("images", [])
-
-            return [base64.b64decode(img) for img in images]
 
 # =========================
 # MESSAGE HANDLER
 # =========================
 @router.message(F.text)
 async def handle_message(message: Message):
-    mode = user_mode.get(message.from_user.id, "text")
+    user_id = message.from_user.id
+    mode = user_mode[user_id]
 
+    # ===== IMAGE MODE =====
     if mode == "image":
         thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
-
         try:
-            images = await generate_craiyon(message.text)
-
-            if not images:
-                await message.answer("❌ Не удалось сгенерировать изображение")
-                return
-
-            # Отправляем первые 3 картинки
-            for img in images[:3]:
-                await message.answer_photo(img)
-
+            await asyncio.sleep(1)
+            image_url = pollinations_image_url(message.text)
+            await message.answer_photo(image_url, caption=message.text)
         except Exception:
-            logging.exception("CRAIYON ERROR")
-            await message.answer("❌ Ошибка генерации через Craiyon")
-
+            logging.exception("POLLINATIONS ERROR")
+            await message.answer("❌ Ошибка генерации изображения")
         finally:
             await thinking.delete()
         return
 
-    # TEXT MODE
-    await message.answer(
-        "💬 Текстовый режим\n\n"
-        "Переключись на 🖼 Craiyon, чтобы генерировать изображения бесплатно."
-    )
+    # ===== TEXT MODE =====
+    async with user_locks[user_id]:
+        thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
+        try:
+            await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+            user_memory[user_id].append(
+                {"role": "user", "content": message.text}
+            )
+
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages.extend(user_memory[user_id])
+
+            response = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=messages,
+                    max_tokens=500,
+                ),
+            )
+
+            answer = response.choices[0].message.content
+            user_memory[user_id].append(
+                {"role": "assistant", "content": answer}
+            )
+
+            await message.answer(answer)
+
+        except Exception:
+            logging.exception("CHAT ERROR")
+            await message.answer("❌ Ошибка ответа")
+        finally:
+            await thinking.delete()
 
 # =========================
 # WEBHOOK SERVER
@@ -156,12 +171,7 @@ def main():
     app.router.add_post("/webhook", handle_webhook)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-    )
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
 
 if __name__ == "__main__":
     main()
