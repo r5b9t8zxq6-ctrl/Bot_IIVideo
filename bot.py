@@ -39,6 +39,13 @@ dp = Dispatcher(bot)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
+# OPENAI LIMITS (CRITICAL)
+# =========================
+OPENAI_TIMEOUT = 25          # секунд
+OPENAI_CONCURRENCY = 1       # Render = 1 CPU
+openai_semaphore = asyncio.Semaphore(OPENAI_CONCURRENCY)
+
+# =========================
 # STICKERS
 # =========================
 THINK_STICKERS = [
@@ -58,7 +65,7 @@ SYSTEM_PROMPT = (
 )
 
 # =========================
-# MEMORY + QUEUE
+# MEMORY + LOCKS
 # =========================
 user_memory = defaultdict(lambda: deque(maxlen=6))
 user_locks = defaultdict(asyncio.Lock)
@@ -73,18 +80,20 @@ async def start_cmd(message: types.Message):
 @dp.message_handler()
 async def chat(message: types.Message):
     user_id = message.from_user.id
+    sticker_msg = None
 
     async with user_locks[user_id]:
-        sticker_msg = None
-
         try:
+            # typing
             await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
 
+            # thinking sticker
             sticker_msg = await bot.send_sticker(
                 message.chat.id,
                 random.choice(THINK_STICKERS)
             )
 
+            # memory
             user_memory[user_id].append({
                 "role": "user",
                 "content": message.text
@@ -93,16 +102,21 @@ async def chat(message: types.Message):
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(user_memory[user_id])
 
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=messages,
-                    temperature=0.8,
-                    max_tokens=600,
+            # OpenAI (SAFE)
+            async with openai_semaphore:
+                loop = asyncio.get_running_loop()
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=messages,
+                            temperature=0.8,
+                            max_tokens=600,
+                        )
+                    ),
+                    timeout=OPENAI_TIMEOUT
                 )
-            )
 
             answer = response.choices[0].message.content
 
@@ -111,6 +125,7 @@ async def chat(message: types.Message):
                 "content": answer
             })
 
+            # delete sticker
             if sticker_msg:
                 await bot.delete_message(
                     message.chat.id,
@@ -122,15 +137,20 @@ async def chat(message: types.Message):
             if "спасибо" in message.text.lower():
                 await bot.send_sticker(message.chat.id, HELP_STICKER)
 
+        except asyncio.TimeoutError:
+            logging.warning("⏱ OpenAI timeout")
+
+            if sticker_msg:
+                await bot.delete_message(message.chat.id, sticker_msg.message_id)
+
+            await message.answer("⏱ Я задумался слишком долго. Попробуй ещё раз.")
+
         except Exception:
-            logging.exception("❌ Ошибка обработки")
+            logging.exception("❌ Ошибка")
 
             if sticker_msg:
                 try:
-                    await bot.delete_message(
-                        message.chat.id,
-                        sticker_msg.message_id
-                    )
+                    await bot.delete_message(message.chat.id, sticker_msg.message_id)
                 except:
                     pass
 
