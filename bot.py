@@ -90,40 +90,40 @@ async def handle_message(message: Message):
     user_id = message.from_user.id
     mode = user_mode[user_id]
 
-    # ===== IMAGE MODE =====
-    if mode == "image":
-        thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
-        try:
-            loop = asyncio.get_running_loop()
-            output = await loop.run_in_executor(
-                None,
-                lambda: replicate_client.run(
-                    SDXL_MODEL = "stability-ai/sdxl"
+    # ================= IMAGE =================
+if mode == "image":
+    thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
+    try:
+        loop = asyncio.get_running_loop()
 
-output = await loop.run_in_executor(
-    None,
-    lambda: replicate_client.run(
-        SDXL_MODEL,
-        input={
-            "prompt": message.text,
-            "width": 1024,
-            "height": 1024,
-            "num_outputs": 1,
-            "guidance_scale": 7.5,
-            "num_inference_steps": 30,
-        },
-    ),
-)
+        output = await loop.run_in_executor(
+            None,
+            lambda: replicate_client.run(
+                SDXL_MODEL,
+                input={
+                    "prompt": message.text,
+                    "width": 1024,
+                    "height": 1024,
+                    "num_outputs": 1,
+                    "guidance_scale": 7.5,
+                    "num_inference_steps": 30,
+                },
+            ),
+        )
 
-            await message.answer_photo(output[0], caption=message.text)
+        await message.answer_photo(output[0], caption=message.text)
 
-        except Exception:
-            logging.exception("IMAGE ERROR")
-            await message.answer("❌ Ошибка генерации изображения. Подожди 10–15 секунд.")
+    except Exception:
+        logging.exception("IMAGE ERROR")
+        await message.answer(
+            "❌ Ошибка генерации изображения.\n"
+            "⏳ Возможно лимит Replicate. Подожди 10–15 секунд."
+        )
 
-        finally:
-            await thinking.delete()
-        return
+    finally:
+        await thinking.delete()
+    return
+
 
     # ===== TEXT MODE =====
     async with user_locks[user_id]:
