@@ -1,46 +1,30 @@
 import os
-import logging
 import asyncio
-import random
-from collections import defaultdict, deque
-
-from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Message
-from aiogram.enums import ChatAction
-from aiogram.filters import CommandStart
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+import logging
+import base64
 
 from aiohttp import web
-from openai import OpenAI
+from aiogram import Bot, Dispatcher, Router
+from aiogram.types import Message, BufferedInputFile
+from aiogram.filters import CommandStart
 
-# =========================
-# 🔍 ENV DIAGNOSTIC (CRITICAL)
-# =========================
-print("===== ENV CHECK =====")
-print("BOT_TOKEN =", os.getenv("BOT_TOKEN"))
-print("OPENAI_API_KEY =", os.getenv("OPENAI_API_KEY"))
-print("WEBHOOK_HOST =", os.getenv("WEBHOOK_HOST"))
-print("=====================")
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# ================== ENV ==================
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://xxxx.onrender.com
-PORT = int(os.getenv("PORT", 10000))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_HOST:
-    raise RuntimeError("❌ Не заданы BOT_TOKEN / OPENAI_API_KEY / WEBHOOK_HOST")
+if not all([BOT_TOKEN, OPENAI_API_KEY, WEBHOOK_URL]):
+    raise RuntimeError("❌ Не заданы BOT_TOKEN / OPENAI_API_KEY / WEBHOOK_URL")
 
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-
-# =========================
-# LOGGING
-# =========================
+# ================== LOG ==================
 logging.basicConfig(level=logging.INFO)
 
-# =========================
-# INIT
-# =========================
+# ================== INIT ==================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
@@ -48,131 +32,94 @@ dp.include_router(router)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =========================
-# LIMITS
-# =========================
-OPENAI_TIMEOUT = 25
-OPENAI_CONCURRENCY = 1
-openai_semaphore = asyncio.Semaphore(OPENAI_CONCURRENCY)
-
-# =========================
-# STICKERS
-# =========================
-THINK_STICKERS = [
-    "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ",
-    "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
-    "CAACAgIAAxkBAAEVFAdpXQI0gobiAo031YwBUpOU400JjQACrjgAAtuNYEloV73kP0r9tjgE",
-]
-
-# =========================
-# PROMPT
-# =========================
-SYSTEM_PROMPT = (
-    "Ты дружелюбный и умный помощник. "
-    "Отвечай живо, понятно и по-человечески."
-)
-
-# =========================
-# MEMORY + LOCKS
-# =========================
-user_memory = defaultdict(lambda: deque(maxlen=6))
-user_locks = defaultdict(asyncio.Lock)
-
-# =========================
-# HANDLERS
-# =========================
+# ================== START ==================
 @router.message(CommandStart())
 async def start(message: Message):
-    await message.answer("👋 Я онлайн. Пиши текст.")
+    await message.answer(
+        "👋 Напиши текст — я отвечу.\n\n"
+        "🖼 Чтобы создать изображение, начни сообщение с:\n"
+        "`/img описание картинки`",
+        parse_mode="Markdown"
+    )
 
-@router.message()
-async def chat(message: Message):
-    user_id = message.from_user.id
-    sticker_msg = None
+# ================== IMAGE ==================
+@router.message(lambda m: m.text and m.text.startswith("/img"))
+async def generate_image(message: Message):
+    prompt = message.text.replace("/img", "", 1).strip()
 
-    async with user_locks[user_id]:
-        try:
-            await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    if not prompt:
+        await message.answer("❗️ Напиши описание после `/img`")
+        return
 
-            sticker_msg = await message.answer_sticker(
-                random.choice(THINK_STICKERS)
+    await message.answer("🎨 Генерирую изображение...")
+
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: openai_client.images.generate(
+                model="gpt-image-1",
+                prompt=prompt,
+                size="1024x1024"
             )
+        )
 
-            user_memory[user_id].append({
-                "role": "user",
-                "content": message.text
-            })
+        image_base64 = result.data[0].b64_json
+        image_bytes = base64.b64decode(image_base64)
 
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            messages.extend(user_memory[user_id])
+        photo = BufferedInputFile(
+            image_bytes,
+            filename="image.png"
+        )
 
-            async with openai_semaphore:
-                loop = asyncio.get_running_loop()
-                response = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None,
-                        lambda: openai_client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=messages,
-                            temperature=0.8,
-                            max_tokens=600,
-                        )
-                    ),
-                    timeout=OPENAI_TIMEOUT
-                )
+        await message.answer_photo(photo, caption="🖼 Готово")
 
-            answer = response.choices[0].message.content
+    except Exception:
+        logging.exception("Ошибка генерации изображения")
+        await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
 
-            user_memory[user_id].append({
-                "role": "assistant",
-                "content": answer
-            })
+# ================== TEXT ==================
+@router.message(lambda m: m.text)
+async def chat(message: Message):
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Ты полезный ассистент."},
+                    {"role": "user", "content": message.text}
+                ],
+                temperature=0.7
+            )
+        )
 
-            if sticker_msg:
-                await sticker_msg.delete()
+        await message.answer(response.choices[0].message.content)
 
-            await message.answer(answer)
+    except Exception:
+        logging.exception("Ошибка генерации текста")
+        await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
 
-        except asyncio.TimeoutError:
-            if sticker_msg:
-                await sticker_msg.delete()
-            await message.answer("⏱ Я завис чуть дольше обычного. Напиши ещё раз.")
-
-        except Exception as e:
-            logging.exception("❌ Ошибка")
-            if sticker_msg:
-                try:
-                    await sticker_msg.delete()
-                except:
-                    pass
-            await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
-
-# =========================
-# WEBHOOK APP
-# =========================
-async def on_startup(app):
+# ================== WEBHOOK ==================
+async def on_startup(app: web.Application):
     await bot.set_webhook(WEBHOOK_URL)
     logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
 
-async def on_shutdown(app):
+async def on_shutdown(app: web.Application):
     await bot.delete_webhook()
     await bot.session.close()
 
-def main():
-    app = web.Application()
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
+app = web.Application()
+app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
 
-    SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    ).register(app, path=WEBHOOK_PATH)
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
-    setup_application(app, dp, bot=bot)
-    web.run_app(app, host="0.0.0.0", port=PORT)
+SimpleRequestHandler(
+    dispatcher=dp,
+    bot=bot
+).register(app, path="/webhook")
 
-# =========================
-# START
-# =========================
 if __name__ == "__main__":
-    main()
+    web.run_app(app, port=int(os.getenv("PORT", 8080)))
