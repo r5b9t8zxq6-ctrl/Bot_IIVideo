@@ -1,177 +1,131 @@
-import os
-import logging
 import asyncio
-import random
-from collections import defaultdict, deque
+import logging
+import os
 
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+
+from aiohttp import web
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatAction
-from aiogram.types import Message
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
+# ================== НАСТРОЙКИ ==================
 
-# =========================
-# ENV
-# =========================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://xxxx.onrender.com
-PORT = int(os.environ.get("PORT", 10000))
-
-if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_HOST:
-    raise RuntimeError("❌ Не заданы переменные окружения")
-
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxxx.onrender.com
 WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
 
-# =========================
-# LOGGING
-# =========================
+if not BOT_TOKEN or not OPENAI_API_KEY or not WEBHOOK_URL:
+    raise RuntimeError("❌ Не заданы BOT_TOKEN / OPENAI_API_KEY / WEBHOOK_URL")
+
 logging.basicConfig(level=logging.INFO)
 
-# =========================
-# INIT
-# =========================
-bot = Bot(BOT_TOKEN)
+# ================== ОБЪЕКТЫ ==================
+
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
-client = OpenAI(api_key=OPENAI_API_KEY)
+router = Router()
+dp.include_router(router)
 
-# =========================
-# LIMITS
-# =========================
-OPENAI_TIMEOUT = 30
-OPENAI_CONCURRENCY = 1
-openai_semaphore = asyncio.Semaphore(OPENAI_CONCURRENCY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =========================
-# MEMORY
-# =========================
-user_memory = defaultdict(lambda: deque(maxlen=6))
-user_locks = defaultdict(asyncio.Lock)
+# защита от одновременных запросов
+openai_semaphore = asyncio.Semaphore(2)
 
-# =========================
-# PROMPT
-# =========================
-SYSTEM_PROMPT = (
-    "Ты умный и дружелюбный ассистент. "
-    "Если пользователь описывает картинку — создай изображение. "
-    "Иначе — отвечай текстом."
-)
+# ================== ХЭНДЛЕРЫ ==================
 
-# =========================
-# START
-# =========================
-@dp.message(F.text == "/start")
-async def start_cmd(message: Message):
+@router.message(CommandStart())
+async def start_handler(message: Message):
     await message.answer(
-        "👋 Напиши текст — я отвечу или сгенерирую изображение / видео."
+        "👋 <b>Привет!</b>\n\n"
+        "Напиши:\n"
+        "• обычный текст — я отвечу\n"
+        "• <i>«нарисуй ...»</i> — я создам изображение 🎨"
     )
 
-# =========================
-# MAIN HANDLER
-# =========================
-@dp.message(F.text)
-async def chat(message: Message):
-    user_id = message.from_user.id
+
+@router.message(F.text)
+async def message_handler(message: Message):
     text = message.text.strip()
     text_lower = text.lower()
 
-    async with user_locks[user_id]:
-        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    try:
+        # ---------- ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЯ ----------
+        image_triggers = (
+            "нарисуй",
+            "создай изображение",
+            "сделай изображение",
+            "картинку",
+            "изображение",
+            "draw",
+            "image",
+        )
 
-        try:
-            # =========================
-            # IMAGE MODE (FORCED)
-            # =========================
-            image_triggers = [
-                "нарисуй",
-                "создай изображение",
-                "сделай изображение",
-                "картинку",
-                "изображение",
-                "image",
-                "draw",
-                "generate image",
-            ]
-
-            if any(trigger in text_lower for trigger in image_triggers):
-                async with openai_semaphore:
-                    result = await asyncio.to_thread(
-                        client.images.generate,
-                        model="gpt-image-1",
-                        prompt=text,
-                        size="1024x1024"
-                    )
-
-                await message.answer_photo(result.data[0].url)
-                return
-
-            # =========================
-            # CHAT MODE
-            # =========================
-            user_memory[user_id].append({
-                "role": "user",
-                "content": text
-            })
-
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            messages.extend(user_memory[user_id])
-
+        if any(t in text_lower for t in image_triggers):
             async with openai_semaphore:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        client.chat.completions.create,
-                        model="gpt-4o-mini",
-                        messages=messages,
-                        temperature=0.8,
-                        max_tokens=700
-                    ),
-                    timeout=OPENAI_TIMEOUT
+                result = await asyncio.to_thread(
+                    openai_client.images.generate,
+                    model="gpt-image-1",
+                    prompt=text,
+                    size="1024x1024",
                 )
 
-            answer = response.choices[0].message.content
+            image_url = result.data[0].url
+            await message.answer_photo(image_url)
+            return
 
-            user_memory[user_id].append({
-                "role": "assistant",
-                "content": answer
-            })
+        # ---------- ГЕНЕРАЦИЯ ТЕКСТА ----------
+        async with openai_semaphore:
+            response = await asyncio.to_thread(
+                openai_client.chat.completions.create,
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Ты полезный Telegram-бот."},
+                    {"role": "user", "content": text},
+                ],
+            )
 
-            await message.answer(answer)
+        reply = response.choices[0].message.content
+        await message.answer(reply)
 
-        except asyncio.TimeoutError:
-            await message.answer("⏱ Слишком долго думаю. Попробуй ещё раз.")
-        except Exception as e:
-            logging.exception("Ошибка")
-            await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
+    except Exception as e:
+        logging.exception("Ошибка обработки сообщения")
+        await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
 
-# =========================
-# WEBHOOK
-# =========================
-async def on_startup(app):
-    await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
 
-async def on_shutdown(app):
+# ================== WEBHOOK ==================
+
+async def on_startup(app: web.Application):
+    await bot.set_webhook(WEBHOOK_FULL_URL)
+    logging.info(f"✅ Webhook установлен: {WEBHOOK_FULL_URL}")
+
+
+async def on_shutdown(app: web.Application):
     await bot.delete_webhook()
     await bot.session.close()
 
+
+async def handle_webhook(request: web.Request):
+    update = await request.json()
+    await dp.feed_raw_update(bot, update)
+    return web.Response(text="OK")
+
+
 def main():
     app = web.Application()
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp)
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
-    web.run_app(app, host="0.0.0.0", port=PORT)
 
-# =========================
-# START
-# =========================
 if __name__ == "__main__":
     main()
