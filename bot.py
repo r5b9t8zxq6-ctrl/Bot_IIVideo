@@ -5,7 +5,7 @@ import random
 from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ChatAction
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
@@ -49,11 +49,11 @@ THINK_STICKER = "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc
 # =========================
 # KEYBOARD
 # =========================
-def keyboard():
+def mode_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="💬 Текст", callback_data="text"),
-            InlineKeyboardButton(text="🖼 Картинка", callback_data="image"),
+            InlineKeyboardButton(text="💬 Текст", callback_data="mode_text"),
+            InlineKeyboardButton(text="🖼 Картинка", callback_data="mode_image"),
         ]]
     )
 
@@ -62,42 +62,68 @@ def keyboard():
 # =========================
 @router.message(F.text == "/start")
 async def start(message: Message):
-    await message.answer("Выбери режим 👇", reply_markup=keyboard())
-
-@router.callback_query()
-async def mode(cb):
-    user_mode[cb.from_user.id] = cb.data
-    await cb.message.answer("Режим изменён")
-    await cb.answer()
+    await message.answer(
+        "Выбери режим 👇",
+        reply_markup=mode_keyboard()
+    )
 
 # =========================
-# MAIN
+# MODE SWITCH
+# =========================
+@router.callback_query(F.data.startswith("mode_"))
+async def switch_mode(cb: CallbackQuery):
+    mode = cb.data.replace("mode_", "")
+    user_mode[cb.from_user.id] = mode
+
+    await cb.message.answer(
+        "🖼 Режим генерации изображений" if mode == "image" else "💬 Текстовый режим"
+    )
+    await cb.answer()  # ОБЯЗАТЕЛЬНО
+
+# =========================
+# IMAGE HANDLER
 # =========================
 @router.message(F.text)
-async def handler(message: Message):
-    if user_mode[message.from_user.id] == "image":
+async def main_handler(message: Message):
+    mode = user_mode[message.from_user.id]
+
+    # ===== IMAGE MODE =====
+    if mode == "image":
         sticker = await message.answer_sticker(THINK_STICKER)
         try:
-            out = await asyncio.get_running_loop().run_in_executor(
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
                 None,
                 lambda: replicate_client.run(
                     "stability-ai/sdxl",
                     input={"prompt": message.text}
                 )
             )
-            await message.answer_photo(out[0])
+
+            await message.answer_photo(
+                photo=result[0],
+                caption=f"🖼 {message.text}"
+            )
         except Exception:
-            await message.answer("Ошибка генерации")
+            logging.exception("IMAGE ERROR")
+            await message.answer("⚠️ Ошибка генерации изображения")
         finally:
             await sticker.delete()
         return
 
+    # ===== TEXT MODE =====
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    res = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": message.text}]
-    )
-    await message.answer(res.choices[0].message.content)
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": message.text}],
+            temperature=0.8,
+        )
+        await message.answer(response.choices[0].message.content)
+    except Exception:
+        logging.exception("TEXT ERROR")
+        await message.answer("⚠️ Ошибка ответа")
 
 # =========================
 # WEBHOOK
