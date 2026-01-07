@@ -46,7 +46,8 @@ THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
 ]
 
-SDXL_MODEL = "stability-ai/sdxl"
+# ✅ РАБОЧАЯ SDXL ВЕРСИЯ
+SDXL_MODEL = "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7d1f7c2e0faeb1d6a9b0c2e4f4a3d"
 
 SYSTEM_PROMPT = "Ты дружелюбный ассистент. Отвечай кратко и по делу."
 
@@ -87,17 +88,19 @@ async def mode_switch(cb: CallbackQuery):
     await cb.answer()
 
 # =========================
-# IMAGE
+# MESSAGE HANDLER
 # =========================
 @router.message(F.text)
 async def handle_message(message: Message):
     user_id = message.from_user.id
     mode = user_mode[user_id]
 
+    # ================= IMAGE =================
     if mode == "image":
         thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
         try:
             loop = asyncio.get_running_loop()
+
             output = await loop.run_in_executor(
                 None,
                 lambda: replicate_client.run(
@@ -106,6 +109,9 @@ async def handle_message(message: Message):
                         "prompt": message.text,
                         "width": 1024,
                         "height": 1024,
+                        "num_outputs": 1,
+                        "guidance_scale": 7.5,
+                        "num_inference_steps": 30,
                     }
                 )
             )
@@ -115,15 +121,16 @@ async def handle_message(message: Message):
 
         except Exception as e:
             logging.exception("IMAGE ERROR")
-            await message.answer("Ошибка генерации изображения")
+            await message.answer(
+                "❌ Ошибка генерации изображения.\n"
+                "⏳ Возможно лимит Replicate. Подожди 10–15 секунд."
+            )
 
         finally:
             await thinking.delete()
         return
 
-    # =========================
-    # TEXT CHAT
-    # =========================
+    # ================= TEXT =================
     async with user_locks[user_id]:
         thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
         try:
