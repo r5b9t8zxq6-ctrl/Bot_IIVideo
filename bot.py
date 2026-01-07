@@ -98,17 +98,23 @@ async def handle_message(message: Message):
             output = await loop.run_in_executor(
                 None,
                 lambda: replicate_client.run(
-                    SDXL_MODEL,
-                    input={
-                        "prompt": message.text,
-                        "width": 1024,
-                        "height": 1024,
-                        "num_outputs": 1,
-                        "guidance_scale": 7.5,
-                        "num_inference_steps": 30,
-                    }
-                )
-            )
+                    SDXL_MODEL = "stability-ai/sdxl"
+
+output = await loop.run_in_executor(
+    None,
+    lambda: replicate_client.run(
+        SDXL_MODEL,
+        input={
+            "prompt": message.text,
+            "width": 1024,
+            "height": 1024,
+            "num_outputs": 1,
+            "guidance_scale": 7.5,
+            "num_inference_steps": 30,
+        }
+    )
+)
+
             await message.answer_photo(output[0], caption=message.text)
 
         except Exception:
