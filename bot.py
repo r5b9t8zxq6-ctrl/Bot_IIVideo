@@ -111,8 +111,8 @@ output = await loop.run_in_executor(
             "num_outputs": 1,
             "guidance_scale": 7.5,
             "num_inference_steps": 30,
-        }
-    )
+        },
+    ),
 )
 
             await message.answer_photo(output[0], caption=message.text)
