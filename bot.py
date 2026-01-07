@@ -137,26 +137,55 @@ async def handle_message(message: Message):
 
     # ===== IMAGE: VERCEL =====
     if mode == "vercel":
-        thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
-        try:
-            async with ClientSession(timeout=ClientTimeout(total=60)) as session:
-                async with session.post(
-                    VERCEL_IMAGE_API,
-                    json={"prompt": message.text},
-                ) as resp:
+    thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=90)) as session:
+            async with session.post(
+                VERCEL_IMAGE_API,
+                json={"prompt": message.text},
+            ) as resp:
+
+                content_type = resp.headers.get("Content-Type", "")
+
+                # 1️⃣ Если вернулся JSON
+                if "application/json" in content_type:
                     data = await resp.json()
 
-            if "image_url" not in data:
-                raise RuntimeError("Нет image_url")
+                    if "image_url" in data:
+                        await message.answer_photo(data["image_url"], caption=message.text)
+                        return
 
-            await message.answer_photo(data["image_url"], caption=message.text)
+                    if "base64" in data:
+                        import base64
+                        image_bytes = base64.b64decode(data["base64"])
+                        await message.answer_photo(
+                            image_bytes,
+                            caption=message.text
+                        )
+                        return
 
-        except Exception:
-            logging.exception("VERCEL ERROR")
-            await message.answer("❌ Ошибка генерации через Vercel")
-        finally:
-            await thinking.delete()
-        return
+                    raise RuntimeError(f"JSON без изображения: {data}")
+
+                # 2️⃣ Если вернулся бинарник (image/png)
+                if "image" in content_type:
+                    image_bytes = await resp.read()
+                    await message.answer_photo(image_bytes, caption=message.text)
+                    return
+
+                # 3️⃣ Всё остальное — ошибка
+                text = await resp.text()
+                raise RuntimeError(f"Неизвестный ответ Vercel: {text}")
+
+    except Exception as e:
+        logging.exception("VERCEL ERROR")
+        await message.answer(
+            "❌ Ошибка генерации через Vercel\n"
+            "Проверь endpoint или формат ответа"
+        )
+    finally:
+        await thinking.delete()
+    return
+
 
     # ===== TEXT MODE =====
     async with user_locks[user_id]:
