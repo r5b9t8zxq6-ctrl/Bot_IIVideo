@@ -28,8 +28,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-VERCEL_IMAGE_API = os.getenv("VERCEL_IMAGE_API")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")          # https://your-domain/webhook
+VERCEL_IMAGE_API = os.getenv("VERCEL_IMAGE_API")  # https://xxx.vercel.app/api/image
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     raise RuntimeError("BOT_TOKEN или WEBHOOK_URL не заданы")
@@ -67,11 +67,9 @@ def main_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="💬 Текст", callback_data="mode_text"),
-            ],
-            [
                 InlineKeyboardButton(text="🖼 Replicate", callback_data="mode_image"),
                 InlineKeyboardButton(text="⚡ Vercel", callback_data="mode_vercel"),
-            ],
+            ]
         ]
     )
 
@@ -80,7 +78,10 @@ def main_keyboard():
 # =========================
 @router.message(F.text == "/start")
 async def start_cmd(message: Message):
-    await message.answer("Привет 👋\nВыбери режим:", reply_markup=main_keyboard())
+    await message.answer(
+        "Привет 👋\nВыбери режим:",
+        reply_markup=main_keyboard()
+    )
 
 # =========================
 # MODE SWITCH
@@ -90,13 +91,13 @@ async def mode_switch(cb: CallbackQuery):
     mode = cb.data.replace("mode_", "")
     user_mode[cb.from_user.id] = mode
 
-    text = {
+    titles = {
         "text": "💬 Режим текста",
         "image": "🖼 Генерация через Replicate",
         "vercel": "⚡ Генерация через Vercel",
-    }.get(mode, "Режим изменён")
+    }
 
-    await cb.message.answer(text)
+    await cb.message.answer(titles.get(mode, "Режим изменён"))
     await cb.answer()
 
 # =========================
@@ -107,7 +108,7 @@ async def handle_message(message: Message):
     user_id = message.from_user.id
     mode = user_mode[user_id]
 
-    # ===== IMAGE: REPLICATE =====
+    # ================= IMAGE (REPLICATE) =================
     if mode == "image":
         thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
         try:
@@ -122,6 +123,8 @@ async def handle_message(message: Message):
                         "width": 1024,
                         "height": 1024,
                         "num_outputs": 1,
+                        "guidance_scale": 7.5,
+                        "num_inference_steps": 30,
                     },
                 ),
             )
@@ -130,73 +133,61 @@ async def handle_message(message: Message):
 
         except Exception:
             logging.exception("REPLICATE ERROR")
-            await message.answer("❌ Ошибка генерации изображения (Replicate)")
+            await message.answer("❌ Ошибка генерации через Replicate")
+
         finally:
             await thinking.delete()
         return
 
-    # ===== IMAGE: VERCEL =====
+    # ================= IMAGE (VERCEL) =================
     if mode == "vercel":
-    thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
-    try:
-        async with ClientSession(timeout=ClientTimeout(total=90)) as session:
-            async with session.post(
-                VERCEL_IMAGE_API,
-                json={"prompt": message.text},
-            ) as resp:
+        thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=90)) as session:
+                async with session.post(
+                    VERCEL_IMAGE_API,
+                    json={"prompt": message.text},
+                ) as resp:
 
-                content_type = resp.headers.get("Content-Type", "")
+                    content_type = resp.headers.get("Content-Type", "")
 
-                # 1️⃣ Если вернулся JSON
-                if "application/json" in content_type:
-                    data = await resp.json()
-
-                    if "image_url" in data:
-                        await message.answer_photo(data["image_url"], caption=message.text)
+                    if "image" in content_type:
+                        image_bytes = await resp.read()
+                        await message.answer_photo(image_bytes, caption=message.text)
                         return
 
-                    if "base64" in data:
-                        import base64
-                        image_bytes = base64.b64decode(data["base64"])
-                        await message.answer_photo(
-                            image_bytes,
-                            caption=message.text
-                        )
-                        return
+                    if "application/json" in content_type:
+                        data = await resp.json()
 
-                    raise RuntimeError(f"JSON без изображения: {data}")
+                        if "image_url" in data:
+                            await message.answer_photo(data["image_url"], caption=message.text)
+                            return
 
-                # 2️⃣ Если вернулся бинарник (image/png)
-                if "image" in content_type:
-                    image_bytes = await resp.read()
-                    await message.answer_photo(image_bytes, caption=message.text)
-                    return
+                        if "base64" in data:
+                            import base64
+                            image_bytes = base64.b64decode(data["base64"])
+                            await message.answer_photo(image_bytes, caption=message.text)
+                            return
 
-                # 3️⃣ Всё остальное — ошибка
-                text = await resp.text()
-                raise RuntimeError(f"Неизвестный ответ Vercel: {text}")
+                        raise RuntimeError(data)
 
-    except Exception as e:
-        logging.exception("VERCEL ERROR")
-        await message.answer(
-            "❌ Ошибка генерации через Vercel\n"
-            "Проверь endpoint или формат ответа"
-        )
-    finally:
-        await thinking.delete()
-    return
+                    raise RuntimeError(await resp.text())
 
+        except Exception:
+            logging.exception("VERCEL ERROR")
+            await message.answer("❌ Ошибка генерации через Vercel")
 
-    # ===== TEXT MODE =====
+        finally:
+            await thinking.delete()
+        return
+
+    # ================= TEXT =================
     async with user_locks[user_id]:
         thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
         try:
             await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-            user_memory[user_id].append(
-                {"role": "user", "content": message.text}
-            )
-
+            user_memory[user_id].append({"role": "user", "content": message.text})
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(user_memory[user_id])
 
@@ -210,15 +201,13 @@ async def handle_message(message: Message):
             )
 
             answer = response.choices[0].message.content
-            user_memory[user_id].append(
-                {"role": "assistant", "content": answer}
-            )
-
+            user_memory[user_id].append({"role": "assistant", "content": answer})
             await message.answer(answer)
 
         except Exception:
             logging.exception("CHAT ERROR")
-            await message.answer("❌ Ошибка ответа")
+            await message.answer("Ошибка ответа")
+
         finally:
             await thinking.delete()
 
@@ -243,7 +232,13 @@ def main():
     app.router.add_post("/webhook", handle_webhook)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+    )
 
 if __name__ == "__main__":
     main()
+
