@@ -1,5 +1,4 @@
 import os
-import time
 import logging
 import random
 import asyncio
@@ -40,6 +39,13 @@ dp = Dispatcher(bot)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
+# OPENAI LIMITS (CRITICAL)
+# =========================
+OPENAI_TIMEOUT = 25          # секунд
+OPENAI_CONCURRENCY = 1       # Render = 1 CPU
+openai_semaphore = asyncio.Semaphore(OPENAI_CONCURRENCY)
+
+# =========================
 # STICKERS
 # =========================
 THINK_STICKERS = [
@@ -54,18 +60,15 @@ HELP_STICKER = "CAACAgIAAxkBAAAAAAA4"
 # PROMPT
 # =========================
 SYSTEM_PROMPT = (
-    "Ты дружелюбный, спокойный и умный помощник. "
-    "Отвечай по-человечески, кратко и понятно."
+    "Ты дружелюбный и умный помощник. "
+    "Отвечай живо, по-человечески и понятно."
 )
 
 # =========================
-# MEMORY / QUEUE / FLOOD
+# MEMORY + LOCKS
 # =========================
 user_memory = defaultdict(lambda: deque(maxlen=6))
 user_locks = defaultdict(asyncio.Lock)
-
-FLOOD_DELAY = 3  # секунд
-user_last_message_time = defaultdict(lambda: 0.0)
 
 # =========================
 # HANDLERS
@@ -77,27 +80,20 @@ async def start_cmd(message: types.Message):
 @dp.message_handler()
 async def chat(message: types.Message):
     user_id = message.from_user.id
-
-    # 🚦 АНТИФЛУД
-    now = time.time()
-    if now - user_last_message_time[user_id] < FLOOD_DELAY:
-        await message.answer("⏳ Подожди пару секунд, я ещё отвечаю")
-        return
-    user_last_message_time[user_id] = now
+    sticker_msg = None
 
     async with user_locks[user_id]:
-        sticker_msg = None
-
         try:
+            # typing
             await bot.send_chat_action(message.chat.id, ChatActions.TYPING)
 
-            # 🤔 THINKING STICKER
+            # thinking sticker
             sticker_msg = await bot.send_sticker(
                 message.chat.id,
                 random.choice(THINK_STICKERS)
             )
 
-            # 🧠 MEMORY
+            # memory
             user_memory[user_id].append({
                 "role": "user",
                 "content": message.text
@@ -106,17 +102,21 @@ async def chat(message: types.Message):
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(user_memory[user_id])
 
-            # 🧵 OpenAI (в executor, чтобы не блокировать event loop)
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=messages,
-                    temperature=0.8,
-                    max_tokens=600,
+            # OpenAI (SAFE)
+            async with openai_semaphore:
+                loop = asyncio.get_running_loop()
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=messages,
+                            temperature=0.8,
+                            max_tokens=600,
+                        )
+                    ),
+                    timeout=OPENAI_TIMEOUT
                 )
-            )
 
             answer = response.choices[0].message.content
 
@@ -125,7 +125,7 @@ async def chat(message: types.Message):
                 "content": answer
             })
 
-            # 🧹 DELETE STICKER
+            # delete sticker
             if sticker_msg:
                 await bot.delete_message(
                     message.chat.id,
@@ -137,19 +137,24 @@ async def chat(message: types.Message):
             if "спасибо" in message.text.lower():
                 await bot.send_sticker(message.chat.id, HELP_STICKER)
 
+        except asyncio.TimeoutError:
+            logging.warning("⏱ OpenAI timeout")
+
+            if sticker_msg:
+                await bot.delete_message(message.chat.id, sticker_msg.message_id)
+
+            await message.answer("⏱ Я задумался слишком долго. Попробуй ещё раз.")
+
         except Exception:
-            logging.exception("❌ Ошибка обработки")
+            logging.exception("❌ Ошибка")
 
             if sticker_msg:
                 try:
-                    await bot.delete_message(
-                        message.chat.id,
-                        sticker_msg.message_id
-                    )
+                    await bot.delete_message(message.chat.id, sticker_msg.message_id)
                 except:
                     pass
 
-            await message.answer("⚠️ Произошла ошибка. Попробуй ещё раз.")
+            await message.answer("⚠️ Ошибка. Попробуй ещё раз.")
 
 # =========================
 # WEBHOOK
