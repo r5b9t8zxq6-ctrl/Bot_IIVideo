@@ -41,13 +41,14 @@ generation_lock = asyncio.Semaphore(1)
 async def start(message: Message):
     await message.answer(
         "👋 Привет!\n\n"
-        "Напиши текст — я сгенерирую изображение.\n"
-        "⏳ Обычно 20–60 секунд."
+        "Напиши описание — я сгенерирую изображение через Ideogram V3.\n"
+        "⏳ 20–60 секунд."
     )
 
 @router.message()
 async def generate_image(message: Message):
     prompt = message.text.strip()
+
     await message.answer("🎨 Генерирую изображение...")
 
     loop = asyncio.get_running_loop()
@@ -58,14 +59,14 @@ async def generate_image(message: Message):
                 loop.run_in_executor(
                     None,
                     lambda: replicate_client.run(
-                        "google/imagen-3",
+                        "ideogram-ai/ideogram-v3-balanced",
                         input={
                             "prompt": prompt,
-                            "safety_filter_level": "block_medium_and_above",
+                            "aspect_ratio": "3:2",
                         }
                     )
                 ),
-                timeout=120
+                timeout=180
             )
     except Exception as e:
         logging.exception("Ошибка Replicate")
@@ -73,25 +74,35 @@ async def generate_image(message: Message):
         return
 
     # =====================
-    # ПРАВИЛЬНАЯ ОБРАБОТКА
+    # ПРАВИЛЬНАЯ ОБРАБОТКА IDEOGRAM
     # =====================
     image_url = None
 
-    if isinstance(output, str):
-        image_url = output
-    elif isinstance(output, list) and output:
-        image_url = output[0]
-    elif hasattr(output, "url"):
+    # ideogram → FileOutput
+    if hasattr(output, "url"):
         image_url = output.url
 
+    # иногда приходит список
+    elif isinstance(output, list) and output:
+        first = output[0]
+        if hasattr(first, "url"):
+            image_url = first.url
+        elif isinstance(first, str):
+            image_url = first
+
+    # fallback
+    elif isinstance(output, str):
+        image_url = output
+
     if not image_url:
+        logging.error(f"Не удалось получить URL: {output}")
         await message.answer("❌ Изображение не получено.")
         return
 
     await bot.send_photo(
         chat_id=message.chat.id,
         photo=image_url,
-        caption="✅ Готово"
+        caption="✅ Ideogram V3 Balanced"
     )
 
 # =====================
