@@ -1,90 +1,85 @@
 import os
-import logging
 import asyncio
+import logging
 import random
-import aiohttp
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile
-from aiogram.filters import CommandStart
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, Update
+from aiogram.enums import ChatAction
 from aiohttp import web
 from dotenv import load_dotenv
+import replicate
 
+# =====================
+# ENV
+# =====================
 load_dotenv()
 
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxx.onrender.com/webhook
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
+if not BOT_TOKEN or not REPLICATE_API_TOKEN or not WEBHOOK_URL:
+    raise RuntimeError("ENV variables missing")
+
+# =====================
+# INIT
+# =====================
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(TOKEN)
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
-# -------------------- BING IMAGE (FREE) --------------------
+replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+THINK_STICKERS = [
+    "CAACAgIAAxkBAAEVFBFpXQKdMXKrifJH_zqRZaibCtB-lQACtwAD9wLID5Dxtgc7IUgdOAQ",
+    "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
+]
 
-async def generate_bing_image(prompt: str) -> bytes:
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        async with session.get(
-            "https://www.bing.com/images/create",
-            params={"q": prompt, "form": "BICAI"},
-            allow_redirects=True,
-        ) as resp:
-            html = await resp.text()
+SDXL_MODEL = "stability-ai/sdxl"
 
-        # ищем первую картинку
-        start = html.find("murl&quot;:&quot;")
-        if start == -1:
-            raise RuntimeError("Bing не вернул изображение")
-
-        start += len("murl&quot;:&quot;")
-        end = html.find("&quot;", start)
-        image_url = html[start:end]
-
-        async with session.get(image_url) as img:
-            return await img.read()
-
-# -------------------- HANDLERS --------------------
-
-@dp.message(CommandStart())
-async def start(message: Message):
-    await message.answer(
-        "🖼 Напиши любой запрос, и я сгенерирую картинку\n\n"
-        "Пример:\n"
-        "• cyberpunk city at night\n"
-        "• realistic portrait of a woman"
-    )
-
-@dp.message(F.text)
+# =====================
+# HANDLER
+# =====================
+@router.message(F.text)
 async def handle_prompt(message: Message):
-    thinking = await message.answer("🎨 Генерирую изображение...")
+    thinking = await message.answer_sticker(random.choice(THINK_STICKERS))
+    await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
 
     try:
-        image_bytes = await generate_bing_image(message.text)
+        loop = asyncio.get_running_loop()
 
-        path = f"/tmp/{random.randint(1000,9999)}.jpg"
-        with open(path, "wb") as f:
-            f.write(image_bytes)
-
-        await message.answer_photo(
-            FSInputFile(path),
-            caption=f"🖼 Запрос:\n{message.text}"
+        result = await loop.run_in_executor(
+            None,
+            lambda: replicate_client.run(
+                SDXL_MODEL,
+                input={
+                    "prompt": message.text,
+                    "width": 1024,
+                    "height": 1024,
+                    "num_outputs": 1,
+                    "guidance_scale": 7.5,
+                    "num_inference_steps": 30,
+                },
+            )
         )
 
-    except Exception as e:
+        image_url = result[0]
+        await message.answer_photo(image_url, caption=message.text)
+
+    except Exception:
         logging.exception("IMAGE ERROR")
-        await message.answer("❌ Не удалось сгенерировать изображение.\nПопробуй переформулировать запрос.")
+        await message.answer("❌ Ошибка генерации изображения")
 
     finally:
         await thinking.delete()
 
-# -------------------- WEBHOOK --------------------
-
+# =====================
+# WEBHOOK
+# =====================
 async def on_startup(app):
     await bot.set_webhook(WEBHOOK_URL)
     logging.info("Webhook установлен")
@@ -93,19 +88,17 @@ async def on_shutdown(app):
     await bot.delete_webhook()
     await bot.session.close()
 
-app = web.Application()
+async def handle_webhook(request: web.Request):
+    update = Update.model_validate(await request.json())
+    await dp.feed_update(bot, update)
+    return web.Response()
 
-SimpleRequestHandler(
-    dispatcher=dp,
-    bot=bot,
-).register(app, path="/webhook")
-
-app.on_startup.append(on_startup)
-app.on_shutdown.append(on_shutdown)
+def main():
+    app = web.Application()
+    app.router.add_post("/webhook", handle_webhook)
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
 
 if __name__ == "__main__":
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
-    )
+    main()
