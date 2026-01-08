@@ -1,222 +1,180 @@
 import os
 import asyncio
 import logging
-import aiofiles
-import replicate
+from aiohttp import web
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    Update
+)
+from aiogram.filters import CommandStart
+
+import replicate
+
+# ================== CONFIG ==================
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxx.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxx.onrender.com/webhook
+
+if not BOT_TOKEN or not REPLICATE_API_TOKEN or not WEBHOOK_URL:
+    raise RuntimeError("❌ Проверь BOT_TOKEN / REPLICATE_API_TOKEN / WEBHOOK_URL")
+
+logging.basicConfig(level=logging.INFO)
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# ─────────────────────────────
-# 🔒 FIXED IDENTITY (НЕ МЕНЯТЬ)
-# ─────────────────────────────
+FIXED_SEED = 777777  # фиксация внешности
 
-FIXED_SEED = 284771
+# ================== PROMPT ENGINE ==================
 
-IDENTITY_PROFILE = """
-Same person in all images.
+def enhance_prompt(user_text: str) -> str:
+    """
+    Усиливаем промт, чтобы модель НЕ игнорировала детали
+    """
+    return f"""
+ULTRA-REALISTIC PROFESSIONAL PHOTO.
+STRICTLY FOLLOW THE DESCRIPTION. DO NOT CHANGE ATTRIBUTES.
 
-Facial features:
-Oval face shape.
-Soft jawline.
-Straight nose.
-Medium-sized lips.
-Symmetrical face.
-Natural skin texture.
+{user_text}
 
-Eyes:
-Almond-shaped eyes.
-Neutral calm gaze.
+Rules (MANDATORY):
+- Hair color, clothing color and gender MUST match exactly
+- If user says blonde → ONLY blonde, NOT brunette
+- If user says white shorts → ONLY white shorts
+- No creative substitutions
+- No random changes
 
-Skin:
-Light natural skin tone.
-No freckles.
-No scars.
+Style:
+- Photorealistic
+- DSLR, 85mm lens
+- Shallow depth of field
+- Natural lighting
+- High detail skin texture
+- Accurate colors
+- Sharp focus
+""".strip()
 
-IMPORTANT:
-This is the SAME PERSON.
-Face structure MUST NOT change.
+
+NEGATIVE_PROMPT = """
+wrong hair color,
+wrong clothing color,
+brunette if blonde specified,
+blue clothes if white specified,
+extra people,
+distorted face,
+cartoon,
+anime,
+painting,
+low quality,
+blurry
 """
 
-# ─────────────────────────────
-# 🎨 RECOGNITION MAPS
-# ─────────────────────────────
+# ================== KEYBOARD ==================
 
-HAIR_MAP = {
-    "блондин": "blonde hair",
-    "блондинка": "blonde hair",
-    "брюнет": "dark brown hair",
-    "брюнетка": "dark brown hair",
-    "рыж": "red hair",
-}
-
-COLOR_MAP = {
-    "бел": "white",
-    "черн": "black",
-    "син": "blue",
-    "красн": "red",
-    "зел": "green",
-    "желт": "yellow",
-}
-
-CLOTHES_MAP = {
-    "шорты": "shorts",
-    "платье": "dress",
-    "курт": "jacket",
-    "футбол": "t-shirt",
-    "кофта": "sweater",
-}
-
-# ─────────────────────────────
-# 🧠 PROMPT ENHANCER
-# ─────────────────────────────
-
-def enhance_prompt(user_text: str):
-    text = user_text.lower()
-
-    hair = "blonde hair"
-    color = "white"
-    clothes = "shorts"
-
-    for k, v in HAIR_MAP.items():
-        if k in text:
-            hair = v
-
-    for k, v in COLOR_MAP.items():
-        if k in text:
-            color = v
-
-    for k, v in CLOTHES_MAP.items():
-        if k in text:
-            clothes = v
-
-    positive_prompt = f"""
-{IDENTITY_PROFILE}
-
-Appearance:
-Hair color is {hair}.
-Hair MUST be {hair}.
-
-Clothing:
-She is wearing {color} {clothes}.
-Clothing MUST be {clothes}.
-Color MUST be {color}.
-
-Photography:
-Ultra realistic professional photo.
-DSLR photo, 85mm lens.
-Shallow depth of field.
-Natural daylight.
-Cinematic lighting.
-High detail skin texture.
-"""
-
-    negative_prompt = """
-different person
-different face
-face change
-age change
-wrong hair color
-brunette, black hair, brown hair, red hair
-wrong clothing
-dress, skirt, jeans, pants, jacket
-cartoon, anime, illustration, 3d
-low quality, blurry
-"""
-
-    return positive_prompt.strip(), negative_prompt.strip()
-
-# ─────────────────────────────
-# 🎛 KEYBOARD
-# ─────────────────────────────
-
-def main_keyboard():
+def generate_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎨 Сгенерировать изображение", callback_data="gen")],
+            [
+                InlineKeyboardButton(text="🎨 Сгенерировать", callback_data="generate")
+            ]
         ]
     )
 
-# ─────────────────────────────
-# 🤖 HANDLERS
-# ─────────────────────────────
+# ================== HANDLERS ==================
 
-@dp.message(F.text == "/start")
+@dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
-        "🧠 Напиши описание изображения:\n\n"
+        "👋 Отправь описание изображения.\n\n"
         "Пример:\n"
-        "👉 блондинка в белых шортах\n\n"
-        "Я зафиксирую внешность и создам реалистичное фото.",
-        reply_markup=main_keyboard()
+        "«Блондинка в белых шортах, стоит на пляже, фотореализм»",
+        reply_markup=generate_keyboard()
     )
 
-@dp.callback_query(F.data == "gen")
-async def ask_prompt(callback):
-    await callback.message.answer("✍️ Напиши описание (одежда, цвет, образ):")
 
 @dp.message(F.text)
-async def generate_image(message: Message):
+async def store_prompt(message: Message):
+    # сохраняем промт во временное состояние (просто в message)
+    message.bot_data = {"prompt": message.text}
+    await message.answer("✅ Описание принято. Нажми «Сгенерировать» 👇",
+                         reply_markup=generate_keyboard())
+
+
+@dp.callback_query(F.data == "generate")
+async def generate_image(callback):
+    message = callback.message
+    user_prompt = getattr(message, "bot_data", {}).get("prompt")
+
+    if not user_prompt:
+        await message.answer("❌ Сначала отправь описание")
+        return
+
     await message.answer("⏳ Генерирую изображение...")
 
-    prompt, negative = enhance_prompt(message.text)
+    prompt = enhance_prompt(user_prompt)
 
     try:
-        output = replicate_client.run(
-            "ideogram-ai/ideogram-v3-balanced",
-            input={
-                "prompt": prompt,
-                "negative_prompt": negative,
-                "seed": FIXED_SEED,
-                "guidance_scale": 11,
-                "aspect_ratio": "3:2"
-            }
+        loop = asyncio.get_running_loop()
+
+        output = await loop.run_in_executor(
+            None,
+            lambda: replicate_client.run(
+                "ideogram-ai/ideogram-v3-balanced",
+                input={
+                    "prompt": prompt,
+                    "negative_prompt": NEGATIVE_PROMPT,
+                    "seed": FIXED_SEED,
+                    "guidance_scale": 11,
+                    "aspect_ratio": "3:2"
+                }
+            )
         )
 
-        image_url = output[0]
-        await message.answer_photo(image_url, caption="✅ Готово")
+        if not output or not isinstance(output, list) or "url" not in output[0]:
+            raise ValueError("Пустой или некорректный ответ Replicate")
+
+        image_url = output[0]["url"]
+
+        await message.answer_photo(
+            image_url,
+            caption="✅ Готово\n\n"
+                    "Если что-то не совпало — уточни описание и попробуй ещё раз."
+        )
 
     except Exception as e:
-        logging.exception(e)
-        await message.answer("❌ Ошибка генерации")
+        logging.exception("GENERATION ERROR")
+        await message.answer(f"❌ Ошибка генерации:\n{e}")
 
-# ─────────────────────────────
-# 🌐 WEBHOOK
-# ─────────────────────────────
+# ================== WEBHOOK ==================
+
+async def webhook_handler(request: web.Request):
+    data = await request.json()
+    update = Update(**data)
+    await dp.feed_webhook_update(bot, update)
+    return web.Response(text="ok")
+
 
 async def on_startup(app):
     await bot.set_webhook(WEBHOOK_URL)
     logging.info("✅ Webhook установлен")
 
-async def on_shutdown(app):
-    await bot.delete_webhook()
 
 def main():
     app = web.Application()
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
+    app.router.add_post("/webhook", webhook_handler)
+    app.on_startup.append(on_startup)
+    web.run_app(app, port=int(os.environ.get("PORT", 8080)))
 
-    SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    ).register(app, path="/")
-
-    setup_application(app, dp, bot=bot)
-    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
 if __name__ == "__main__":
     main()
