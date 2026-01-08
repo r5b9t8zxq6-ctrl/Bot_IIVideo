@@ -1,16 +1,19 @@
 import os
 import logging
+import asyncio
 import replicate
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.filters import CommandStart
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 from dotenv import load_dotenv
-import asyncio
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -19,103 +22,113 @@ dp = Dispatcher()
 
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# 🔒 Референс-изображения (можно заменить)
-BASE_IMAGES = [
-    "https://replicate.delivery/pbxt/OHhQ8FA8tnsvZWK2uq79oxnWwwfS2LYsV1DssplVT6283Xn5/01.webp"
-]
-
-# 🧠 Усиление промта + фиксация внешности
+# 🧠 Улучшение промта
 def enhance_prompt_ru(text: str) -> str:
-    text = text.lower().strip()
-
-    hair_map = {
-        "блондинка": "blonde woman",
-        "брюнетка": "brunette woman",
-        "рыжая": "red-haired woman",
-        "блондин": "blonde man",
-        "брюнет": "brunette man"
-    }
-
-    clothes_map = {
-        "белых шортах": "white shorts",
-        "черных шортах": "black shorts",
-        "синей куртке": "blue jacket",
-        "белой футболке": "white t-shirt",
-        "черном платье": "black dress"
-    }
-
-    appearance = []
-    clothing = []
-
-    for ru, en in hair_map.items():
-        if ru in text:
-            appearance.append(en)
-
-    for ru, en in clothes_map.items():
-        if ru in text:
-            clothing.append(en)
-
-    appearance_text = ", ".join(appearance) if appearance else "young woman"
-    clothing_text = ", ".join(clothing) if clothing else "casual outfit"
-
     return f"""
-ULTRA-REALISTIC PHOTO EDIT.
+PHOTO-REALISTIC IMAGE EDIT.
 
-SUBJECT:
-{appearance_text}
-
-CLOTHING:
-{clothing_text}
+TASK:
+{text}
 
 STYLE:
-photo-realistic, natural lighting, 35mm lens, shallow depth of field,
-sharp focus, cinematic realism, high detail skin texture
+ultra realistic photo, natural lighting, 35mm lens,
+sharp focus, high detail, cinematic look
 
-STRICT RULES:
-- DO NOT change hair color
-- DO NOT change clothing colors
-- DO NOT change gender
-- NO artistic interpretation
-- NO random outfit changes
+RULES:
+- Keep realism
+- No random changes
+- No art style
 """
 
+# ▶️ /start
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
-        "🖼 Напиши описание внешности и одежды.\n\n"
-        "Пример:\n"
-        "👉 блондинка в белых шортах и черной майке"
+        "🖼 Я умею:\n"
+        "1️⃣ Генерировать изображения по тексту\n"
+        "2️⃣ Редактировать фото (добавлять / убирать объекты)\n\n"
+        "📌 Просто:\n"
+        "— напиши текст\n"
+        "— или отправь фото + текст"
     )
 
-@dp.message()
-async def generate(message: Message):
-    if not message.text:
-        await message.answer("❗ Отправь текстовое описание.")
+# 🖼 Фото + текст = редактирование
+@dp.message(F.photo)
+async def image_edit(message: Message):
+    if not message.caption:
+        await message.answer("✏️ Напиши, что сделать с этим фото")
         return
 
-    await message.answer("🎨 Генерирую изображение...")
+    await message.answer("🎨 Редактирую изображение...")
+
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+
+    prompt = enhance_prompt_ru(message.caption)
 
     try:
-        prompt = enhance_prompt_ru(message.text)
-
         output = replicate_client.run(
             "qwen/qwen-image-edit-2511",
             input={
-                "image": BASE_IMAGES,
+                "image": [image_url],
                 "prompt": prompt,
                 "aspect_ratio": "3:4"
             }
         )
 
-        for item in output:
-            await message.answer_photo(item.url)
+        for img in output:
+            await message.answer_photo(img.url)
 
     except Exception as e:
         logging.exception(e)
-        await message.answer("❌ Ошибка генерации. Попробуй другой текст.")
+        await message.answer("❌ Ошибка редактирования")
 
-async def main():
-    await dp.start_polling(bot)
+# ✨ Только текст = генерация
+@dp.message(F.text)
+async def image_generate(message: Message):
+    await message.answer("🎨 Генерирую изображение...")
+
+    prompt = enhance_prompt_ru(message.text)
+
+    try:
+        output = replicate_client.run(
+            "qwen/qwen-image-edit-2511",
+            input={
+                "prompt": prompt,
+                "aspect_ratio": "3:4"
+            }
+        )
+
+        for img in output:
+            await message.answer_photo(img.url)
+
+    except Exception as e:
+        logging.exception(e)
+        await message.answer("❌ Ошибка генерации")
+
+# 🌐 WEBHOOK
+async def on_startup(app):
+    await bot.set_webhook(WEBHOOK_URL)
+
+async def on_shutdown(app):
+    await bot.delete_webhook()
+
+def main():
+    app = web.Application()
+
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+
+    webhook_handler.register(app, path="/webhook")
+    setup_application(app, dp, bot=bot)
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
