@@ -1,112 +1,104 @@
 import os
 import logging
 import replicate
-from aiogram import Bot, Dispatcher, F
+from fastapi import FastAPI, Request
+from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from aiogram.filters import CommandStart
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from dotenv import load_dotenv
-import asyncio
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-app.onrender.com/webhook
+PORT = int(os.getenv("PORT", 10000))
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+app = FastAPI()
 
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# fallback image (если юзер не прислал фото)
-BASE_IMAGES = [
-    "https://replicate.delivery/pbxt/OHhQ8FA8tnsvZWK2uq79oxnWwwfS2LYsV1DssplVT6283Xn5/01.webp"
-]
-
-
-def enhance_prompt_ru(text: str) -> str:
+# ---------- PROMPT ----------
+def enhance_prompt(text: str) -> str:
     return f"""
-ULTRA REALISTIC PHOTO EDIT
-
-TASK:
+Ultra realistic photo.
 {text}
-
-RULES:
-- photo realistic
-- natural lighting
-- 35mm lens
-- sharp focus
-- no style changes unless requested
+Natural lighting, 35mm photo, high detail, cinematic realism.
 """
 
-
+# ---------- COMMAND ----------
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
-        "🖼 Я умею:\n"
-        "— генерировать изображение по описанию\n"
-        "— редактировать твоё фото\n\n"
-        "📸 Пришли фото + текст\n"
-        "✍️ Или просто напиши текст"
+        "🖼 Напиши текст — сгенерирую изображение\n"
+        "📸 Или отправь фото + текст — отредактирую"
     )
 
+# ---------- TEXT → IMAGE ----------
+@dp.message(lambda m: m.text and not m.photo)
+async def text_to_image(message: Message):
+    await message.answer("🎨 Генерирую изображение...")
 
-@dp.message(F.photo)
-async def edit_user_photo(message: Message):
-    await message.answer("🎨 Редактирую твоё фото...")
+    output = replicate_client.run(
+        "qwen/qwen-image-edit-2511",
+        input={
+            "image": [],
+            "prompt": enhance_prompt(message.text),
+            "aspect_ratio": "3:4"
+        }
+    )
+
+    for item in output:
+        await message.answer_photo(item.url)
+
+# ---------- IMAGE → IMAGE ----------
+@dp.message(lambda m: m.photo)
+async def image_edit(message: Message):
+    await message.answer("🧠 Обрабатываю фото...")
 
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
-    photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+    image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
 
-    prompt = enhance_prompt_ru(message.caption or "improve photo realism")
+    prompt = message.caption or "Improve photo quality"
 
-    try:
-        output = replicate_client.run(
-            "qwen/qwen-image-edit-2511",
-            input={
-                "image": [photo_url],
-                "prompt": prompt,
-                "aspect_ratio": "3:4"
-            }
-        )
+    output = replicate_client.run(
+        "qwen/qwen-image-edit-2511",
+        input={
+            "image": [image_url],
+            "prompt": enhance_prompt(prompt),
+            "aspect_ratio": "3:4"
+        }
+    )
 
-        for item in output:
-            await message.answer_photo(item.url)
+    for item in output:
+        await message.answer_photo(item.url)
 
-    except Exception as e:
-        logging.exception(e)
-        await message.answer("❌ Ошибка обработки изображения")
+# ---------- WEBHOOK ----------
+@app.on_event("startup")
+async def on_startup():
+    await bot.set_webhook(WEBHOOK_URL)
 
+@app.on_event("shutdown")
+async def on_shutdown():
+    await bot.delete_webhook()
 
-@dp.message(F.text)
-async def generate_from_text(message: Message):
-    await message.answer("🎨 Генерирую изображение...")
+@app.post("/webhook")
+async def webhook(request: Request):
+    update = await request.json()
+    await dp.feed_update(bot, update)
 
-    prompt = enhance_prompt_ru(message.text)
+# ---------- HEALTH CHECK ----------
+@app.get("/")
+async def health():
+    return {"status": "ok"}
 
-    try:
-        output = replicate_client.run(
-            "qwen/qwen-image-edit-2511",
-            input={
-                "image": BASE_IMAGES,
-                "prompt": prompt,
-                "aspect_ratio": "3:4"
-            }
-        )
-
-        for item in output:
-            await message.answer_photo(item.url)
-
-    except Exception as e:
-        logging.exception(e)
-        await message.answer("❌ Ошибка генерации")
-
-
-async def main():
-    await dp.start_polling(bot)
-
-
+# ---------- RUN ----------
 if __name__ == "__main__":
-    asyncio.run(main())
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
