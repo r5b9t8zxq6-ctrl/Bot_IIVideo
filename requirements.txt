@@ -1,4 +1,6 @@
 aiogram==3.*
+fastapi
+uvicorn
 python-dotenv
 replicate
 aiohttp
