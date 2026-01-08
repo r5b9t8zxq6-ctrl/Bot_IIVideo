@@ -1,140 +1,122 @@
 import os
 import asyncio
 import logging
+import aiohttp
+import aiofiles
+import replicate
+
+from aiogram import Bot, Dispatcher, Router
+from aiogram.types import Message, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart
 from aiohttp import web
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Update
-)
-from aiogram.filters import CommandStart
-
-import replicate
-
-# ================== CONFIG ==================
-
+# -------------------- ENV --------------------
 load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.environ.get("PORT", 8000))
 
-if not BOT_TOKEN or not REPLICATE_API_TOKEN or not WEBHOOK_URL:
-    raise RuntimeError("❌ Проверь BOT_TOKEN / REPLICATE_API_TOKEN / WEBHOOK_URL")
+replicate.Client(api_token=REPLICATE_API_TOKEN)
 
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
-
-replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
-
-FIXED_SEED = 777777
-
-# ================== PROMPT ENGINE ==================
-
-def enhance_prompt(user_text: str) -> str:
-    return f"""
-ULTRA-REALISTIC PHOTO. STRICT RULES.
-
+# -------------------- AI PROMPT LOGIC --------------------
+def enhance_prompt(user_text: str) -> tuple[str, str]:
+    base = f"""
+Ultra realistic professional photography.
+The subject MUST strictly follow these attributes:
 {user_text}
 
-MANDATORY:
-- Exact hair color
-- Exact clothing color
-- No substitutions
-- No creativity
+Important rules:
+- hair color must match EXACTLY
+- clothes color must match EXACTLY
+- no color variation
+- no style deviation
+- no reinterpretation
 
-Photo style:
-- DSLR 85mm
-- Natural lighting
-- Sharp focus
-- Realistic colors
-""".strip()
-
-NEGATIVE_PROMPT = """
-wrong hair color,
-wrong clothes color,
-color mismatch,
-extra people,
-anime,
-cartoon,
-painting,
-blurry,
-low quality
+High detail, natural lighting, sharp focus, 8k quality,
+cinematic composition, professional color grading.
 """
 
-# ================== UI ==================
+    negative = """
+wrong hair color,
+wrong clothes color,
+different outfit,
+brunette if blonde requested,
+blue clothes if white requested,
+artistic reinterpretation,
+fantasy style,
+cartoon,
+illustration,
+painting,
+low quality,
+blurry
+"""
+    return base.strip(), negative.strip()
 
-def keyboard():
+# -------------------- BOT SETUP --------------------
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+# -------------------- UI --------------------
+def main_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎨 Сгенерировать", callback_data="generate")]
+            [InlineKeyboardButton(text="🎨 Сгенерировать изображение", callback_data="gen")]
         ]
     )
 
-# ================== HANDLERS ==================
-
-@dp.message(CommandStart())
+# -------------------- HANDLERS --------------------
+@router.message(CommandStart())
 async def start(message: Message):
     await message.answer(
         "👋 Отправь описание изображения.\n\n"
         "Пример:\n"
-        "«Блондинка в белых шортах на пляже, фотореализм»",
-        reply_markup=keyboard()
+        "👉 блондинка в белых шортах на пляже",
+        reply_markup=main_keyboard()
     )
 
-@dp.message(F.text)
-async def save_prompt(message: Message):
-    dp.workflow_data[message.chat.id] = message.text
-    await message.answer("✅ Описание сохранено", reply_markup=keyboard())
+@router.callback_query(lambda c: c.data == "gen")
+async def generate(callback):
+    await callback.answer("✏️ Напиши описание изображение сообщением")
 
-@dp.callback_query(F.data == "generate")
-async def generate(call):
-    chat_id = call.message.chat.id
-    user_prompt = dp.workflow_data.get(chat_id)
+@router.message()
+async def generate_image(message: Message):
+    prompt, negative = enhance_prompt(message.text)
 
-    if not user_prompt:
-        await call.message.answer("❌ Сначала отправь описание")
-        return
-
-    await call.message.answer("⏳ Генерация...")
+    await message.answer("⏳ Генерирую изображение...")
 
     try:
-        loop = asyncio.get_running_loop()
-
-        output = await loop.run_in_executor(
-            None,
-            lambda: replicate_client.run(
-                "ideogram-ai/ideogram-v3-balanced",
-                input={
-                    "prompt": enhance_prompt(user_prompt),
-                    "negative_prompt": NEGATIVE_PROMPT,
-                    "seed": FIXED_SEED,
-                    "guidance_scale": 12,
-                    "aspect_ratio": "3:2"
-                }
-            )
+        output = replicate.run(
+            "ideogram-ai/ideogram-v3-balanced",
+            input={
+                "prompt": prompt,
+                "negative_prompt": negative,
+                "aspect_ratio": "3:2"
+            }
         )
 
-        image_url = output[0]["url"]
-        await call.message.answer_photo(image_url)
+        image_url = output[0] if isinstance(output, list) else output.url
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                img = await resp.read()
+
+        photo = BufferedInputFile(img, filename="image.png")
+        await message.answer_photo(photo, caption="✅ Готово")
 
     except Exception as e:
-        logging.exception("GEN ERROR")
-        await call.message.answer(f"❌ Ошибка генерации:\n{e}")
+        logging.exception(e)
+        await message.answer("❌ Ошибка генерации. Попробуй изменить описание.")
 
-# ================== WEBHOOK ==================
-
-async def webhook_handler(request: web.Request):
-    update = Update.model_validate(await request.json())
-    await dp.feed_webhook_update(bot, update)
-    return web.Response(text="ok")
+# -------------------- WEBHOOK --------------------
+async def webhook_handler(request):
+    data = await request.json()
+    await dp.feed_webhook_update(bot, data)
+    return web.Response(text="OK")
 
 async def on_startup(app):
     await bot.set_webhook(WEBHOOK_URL)
@@ -144,13 +126,11 @@ async def on_shutdown(app):
     await bot.session.close()
     logging.info("🛑 Bot session closed")
 
-def main():
-    app = web.Application()
-    app.router.add_post("/webhook", webhook_handler)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    web.run_app(app, host="0.0.0.0", port=PORT)
+# -------------------- APP --------------------
+app = web.Application()
+app.router.add_post("/webhook", webhook_handler)
+app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
 
 if __name__ == "__main__":
-    main()
+    web.run_app(app, host="0.0.0.0", port=8000)
