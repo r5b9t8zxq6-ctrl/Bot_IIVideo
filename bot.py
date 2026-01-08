@@ -20,7 +20,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 8000))
 
 if not BOT_TOKEN or not REPLICATE_API_TOKEN or not WEBHOOK_URL:
-    raise RuntimeError("❌ ENV переменные не заданы")
+    raise RuntimeError("❌ Не заданы ENV переменные")
 
 # =======================
 # LOG
@@ -42,20 +42,22 @@ replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 # =======================
 @router.message(F.text == "/start")
 async def start(message: Message):
-    await message.answer("👋 Пришли текст — я сгенерирую изображение")
+    await message.answer(
+        "👋 Пришли текст — я сгенерирую изображение через Google Imagen-3"
+    )
 
 # =======================
 # MESSAGE HANDLER
 # =======================
 @router.message(F.text)
 async def handle_prompt(message: Message):
-    # ⚠️ ВАЖНО: ничего долгого тут
-    asyncio.create_task(generate_and_send(message))
+    # ❗ ничего долгого здесь
+    asyncio.create_task(generate_and_send_image(message))
 
 # =======================
 # IMAGE GENERATION (BACKGROUND)
 # =======================
-async def generate_and_send(message: Message):
+async def generate_and_send_image(message: Message):
     thinking = await message.answer("🎨 Генерирую изображение...")
 
     try:
@@ -64,23 +66,28 @@ async def generate_and_send(message: Message):
         output = await loop.run_in_executor(
             None,
             lambda: replicate_client.run(
-                "recraft-ai/recraft-v3",
+                "google/imagen-3",
                 input={
                     "prompt": message.text,
-                    "size": "1365x1024"
+                    "safety_filter_level": "block_medium_and_above"
                 }
             )
         )
 
-        # Recraft возвращает FileOutput
-        image_url = output.url
+        # Imagen может вернуть список или одиночный FileOutput
+        if isinstance(output, list):
+            image = output[0]
+        else:
+            image = output
+
+        image_url = image.url
 
         await message.answer_photo(
             photo=image_url,
             caption=message.text
         )
 
-    except Exception as e:
+    except Exception:
         logging.exception("IMAGE ERROR")
         await message.answer("❌ Ошибка генерации изображения")
 
