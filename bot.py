@@ -39,7 +39,7 @@ THINK_STICKERS = [
     "CAACAgIAAxkBAAEVFA9pXQJ_YAVXD8qH9yNaYjarJi04ugACiQoAAnFuiUvTl1zojCsDsDgE",
 ]
 
-SDXL_MODEL = "stability-ai/sdxl"
+RECRAFT_MODEL = "recraft-ai/recraft-v3"
 
 # =====================
 # HANDLER
@@ -52,23 +52,24 @@ async def handle_prompt(message: Message):
     try:
         loop = asyncio.get_running_loop()
 
-        result = await loop.run_in_executor(
+        output = await loop.run_in_executor(
             None,
             lambda: replicate_client.run(
-                SDXL_MODEL,
+                RECRAFT_MODEL,
                 input={
                     "prompt": message.text,
-                    "width": 1024,
-                    "height": 1024,
-                    "num_outputs": 1,
-                    "guidance_scale": 7.5,
-                    "num_inference_steps": 30,
-                },
+                    "size": "1365x1024"
+                }
             )
         )
 
-        image_url = result[0]
-        await message.answer_photo(image_url, caption=message.text)
+        # Recraft возвращает File-like объект
+        image_url = output.url
+
+        await message.answer_photo(
+            photo=image_url,
+            caption=message.text
+        )
 
     except Exception:
         logging.exception("IMAGE ERROR")
