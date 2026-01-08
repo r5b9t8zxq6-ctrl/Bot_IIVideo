@@ -1,20 +1,21 @@
 import os
 import asyncio
 import logging
-from aiohttp import web
-from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, Router, F
+from aiohttp import web
+from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, Update
+from aiogram.filters import CommandStart
 
 import replicate
+from dotenv import load_dotenv
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", 8000))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxx.onrender.com
+WEBHOOK_PATH = "/webhook"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -25,47 +26,59 @@ dp.include_router(router)
 
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# =====================
-# HANDLERS
-# =====================
+# 🔒 только ОДНА генерация за раз
+generation_lock = asyncio.Semaphore(1)
 
-@router.message(F.text == "/start")
+# ---------- handlers ----------
+
+@router.message(CommandStart())
 async def start(message: Message):
-    await message.answer("👋 Пришли текст — сгенерирую изображение")
+    await message.answer(
+        "👋 Привет!\n\n"
+        "Отправь текст — я сгенерирую изображение.\n"
+        "⚠️ Генерация может занять до 1 минуты."
+    )
 
-@router.message(F.text)
-async def prompt_handler(message: Message):
-    asyncio.create_task(generate_image(message))
-
+@router.message()
 async def generate_image(message: Message):
-    wait = await message.answer("🎨 Генерирую изображение...")
+    prompt = message.text.strip()
 
-    try:
-        loop = asyncio.get_running_loop()
-        output = await loop.run_in_executor(
-            None,
-            lambda: replicate_client.run(
-                "google/imagen-3",
-                input={
-                    "prompt": message.text,
-                    "safety_filter_level": "block_medium_and_above"
-                }
+    await message.answer("🎨 Генерирую изображение, подожди немного…")
+
+    loop = asyncio.get_running_loop()
+
+    async with generation_lock:
+        try:
+            output = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: replicate_client.run(
+                        "google/imagen-3",
+                        input={
+                            "prompt": prompt,
+                            "safety_filter_level": "block_medium_and_above"
+                        }
+                    )
+                ),
+                timeout=120  # ⏱ максимум 2 минуты
             )
-        )
+        except asyncio.TimeoutError:
+            await message.answer("⏱ Слишком долго. Попробуй другой запрос.")
+            return
+        except Exception as e:
+            logging.exception("Ошибка генерации")
+            await message.answer("❌ Ошибка генерации изображения.")
+            return
 
-        image = output[0] if isinstance(output, list) else output
-        await message.answer_photo(photo=image.url)
+    # результат — список URL
+    if isinstance(output, list) and output:
+        await bot.send_photo(message.chat.id, photo=output[0])
+    else:
+        await message.answer("❌ Не удалось получить изображение.")
 
-    except Exception as e:
-        logging.exception(e)
-        await message.answer("❌ Ошибка генерации")
+    await asyncio.sleep(0)  # освобождаем event loop
 
-    finally:
-        await wait.delete()
-
-# =====================
-# WEBHOOK
-# =====================
+# ---------- webhook ----------
 
 async def webhook_handler(request: web.Request):
     data = await request.json()
@@ -73,25 +86,15 @@ async def webhook_handler(request: web.Request):
     await dp.feed_webhook_update(bot, update)
     return web.Response(text="ok")
 
-async def on_startup(app):
-    await bot.set_webhook(WEBHOOK_URL)
+async def on_startup(app: web.Application):
+    await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
     logging.info("✅ Webhook установлен")
 
-async def on_shutdown(app):
-    await bot.delete_webhook()
-    await bot.session.close()
+# ---------- app ----------
 
-# =====================
-# SERVER
-# =====================
-
-def main():
-    app = web.Application()
-    app.router.add_post("/webhook", webhook_handler)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    web.run_app(app, host="0.0.0.0", port=PORT)
+app = web.Application()
+app.router.add_post(WEBHOOK_PATH, webhook_handler)
+app.on_startup.append(on_startup)
 
 if __name__ == "__main__":
-    main()
+    web.run_app(app, port=int(os.environ.get("PORT", 10000)))
