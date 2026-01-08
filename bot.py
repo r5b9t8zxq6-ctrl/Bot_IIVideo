@@ -1,21 +1,24 @@
 import os
 import logging
+import asyncio
 import replicate
+
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message
+from aiogram.types import Message, Update
 from aiogram.filters import CommandStart
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from dotenv import load_dotenv
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-app.onrender.com/webhook
-PORT = int(os.getenv("PORT", 10000))
 
-logging.basicConfig(level=logging.INFO)
+# ⚠️ ЖЁСТКО задаём webhook
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = "https://bot-iivideo.onrender.com/webhook"
+PORT = int(os.getenv("PORT", 10000))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -44,9 +47,10 @@ async def start(message: Message):
 async def text_to_image(message: Message):
     await message.answer("🎨 Генерирую изображение...")
 
-    output = replicate_client.run(
+    output = await asyncio.to_thread(
+        replicate_client.run,
         "qwen/qwen-image-edit-2511",
-        input={
+        {
             "image": [],
             "prompt": enhance_prompt(message.text),
             "aspect_ratio": "3:4"
@@ -67,9 +71,10 @@ async def image_edit(message: Message):
 
     prompt = message.caption or "Improve photo quality"
 
-    output = replicate_client.run(
+    output = await asyncio.to_thread(
+        replicate_client.run,
         "qwen/qwen-image-edit-2511",
-        input={
+        {
             "image": [image_url],
             "prompt": enhance_prompt(prompt),
             "aspect_ratio": "3:4"
@@ -80,23 +85,27 @@ async def image_edit(message: Message):
         await message.answer_photo(item.url)
 
 # ---------- WEBHOOK ----------
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    update = Update.model_validate(await request.json())
+    await dp.feed_update(bot, update)
+    return {"ok": True}
+
+# ---------- HEALTH ----------
+@app.get("/")
+async def health():
+    return {"status": "ok"}
+
+# ---------- LIFECYCLE ----------
 @app.on_event("startup")
 async def on_startup():
+    await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL)
+    logging.info("✅ Webhook установлен")
 
 @app.on_event("shutdown")
 async def on_shutdown():
     await bot.delete_webhook()
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    update = await request.json()
-    await dp.feed_update(bot, update)
-
-# ---------- HEALTH CHECK ----------
-@app.get("/")
-async def health():
-    return {"status": "ok"}
 
 # ---------- RUN ----------
 if __name__ == "__main__":
