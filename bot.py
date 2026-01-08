@@ -46,38 +46,35 @@ async def start(message: Message):
 @dp.message(lambda m: m.text and not m.photo)
 async def text_to_image(message: Message):
     await message.answer("🎨 Генерирую изображение...")
-    asyncio.create_task(process_text(message))
 
+    def generate():
+        return replicate_client.run(
+            "qwen/qwen-image-edit-2511",
+            input={
+                "image": [],
+                "prompt": enhance_prompt(message.text),
+                "aspect_ratio": "3:4"
+            }
+        )
 
-async def process_text(message: Message):
-    output = replicate_client.run(
-        "qwen/qwen-image-edit-2511",
-        input={
-            "image": [],
-            "prompt": enhance_prompt(message.text),
-            "aspect_ratio": "3:4"
-        }
-    )
+    output = await asyncio.to_thread(generate)
 
     for item in output:
-        await bot.send_photo(message.chat.id, item.url)
+        await message.answer_photo(item.url)
 
 # ---------- IMAGE → IMAGE ----------
 @dp.message(lambda m: m.photo)
 async def image_edit(message: Message):
     await message.answer("🧠 Обрабатываю фото...")
-    asyncio.create_task(process_image(message))
 
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
 
-async def process_image(message: Message):
-    try:
-        photo = message.photo[-1]
-        file = await bot.get_file(photo.file_id)
-        image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+    prompt = message.caption or "Improve photo quality"
 
-        prompt = message.caption or "Improve photo quality"
-
-        output = replicate_client.run(
+    def generate():
+        return replicate_client.run(
             "qwen/qwen-image-edit-2511",
             input={
                 "image": [image_url],
@@ -86,11 +83,10 @@ async def process_image(message: Message):
             }
         )
 
-        for item in output:
-            await bot.send_photo(message.chat.id, item.url)
+    output = await asyncio.to_thread(generate)
 
-    except Exception as e:
-        await bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+    for item in output:
+        await message.answer_photo(item.url)
 
 # ---------- WEBHOOK ----------
 @app.post("/webhook")
