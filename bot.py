@@ -32,7 +32,6 @@ dp.include_router(router)
 
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# только 1 генерация одновременно (Render Free)
 generation_lock = asyncio.Semaphore(1)
 
 # =====================
@@ -53,8 +52,8 @@ async def generate_image(message: Message):
 
     loop = asyncio.get_running_loop()
 
-    async with generation_lock:
-        try:
+    try:
+        async with generation_lock:
             output = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
@@ -68,18 +67,32 @@ async def generate_image(message: Message):
                 ),
                 timeout=120
             )
-        except asyncio.TimeoutError:
-            await message.answer("⏱ Слишком долго. Попробуй другой запрос.")
-            return
-        except Exception:
-            logging.exception("Ошибка Replicate")
-            await message.answer("❌ Ошибка генерации.")
-            return
+    except Exception as e:
+        logging.exception("Ошибка Replicate")
+        await message.answer("❌ Ошибка генерации.")
+        return
 
-    if isinstance(output, list) and output:
-        await bot.send_photo(message.chat.id, photo=output[0])
-    else:
+    # =====================
+    # ПРАВИЛЬНАЯ ОБРАБОТКА
+    # =====================
+    image_url = None
+
+    if isinstance(output, str):
+        image_url = output
+    elif isinstance(output, list) and output:
+        image_url = output[0]
+    elif hasattr(output, "url"):
+        image_url = output.url
+
+    if not image_url:
         await message.answer("❌ Изображение не получено.")
+        return
+
+    await bot.send_photo(
+        chat_id=message.chat.id,
+        photo=image_url,
+        caption="✅ Готово"
+    )
 
 # =====================
 # WEBHOOK
