@@ -70,7 +70,7 @@ async def generate_image(message: Message):
 async def webhook_handler(request: web.Request):
     data = await request.json()
     update = Update(**data)
-    await dp.handle_update(bot, update)
+    await dp.feed_webhook_update(bot, update)
     return web.Response(text="ok")
 
 async def on_startup(app):
