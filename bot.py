@@ -85,9 +85,11 @@ async def image_edit(message: Message):
         await message.answer_photo(item.url)
 
 # ---------- WEBHOOK ----------
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    update = Update.model_validate(await request.json())
+@app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    logging.info(f"Incoming update: {data}")
+    update = Update.model_validate(data)
     await dp.feed_update(bot, update)
     return {"ok": True}
 
