@@ -1,12 +1,10 @@
 import os
-import asyncio
 import logging
 import aiohttp
-import aiofiles
 import replicate
 
 from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Message, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, BufferedInputFile
 from aiogram.filters import CommandStart
 from aiohttp import web
 from dotenv import load_dotenv
@@ -15,78 +13,59 @@ from dotenv import load_dotenv
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://bot-iivideo.onrender.com/
 
 replicate.Client(api_token=REPLICATE_API_TOKEN)
 
 logging.basicConfig(level=logging.INFO)
 
-# -------------------- AI PROMPT LOGIC --------------------
-def enhance_prompt(user_text: str) -> tuple[str, str]:
-    base = f"""
+# -------------------- PROMPT --------------------
+def enhance_prompt(text: str):
+    prompt = f"""
 Ultra realistic professional photography.
-The subject MUST strictly follow these attributes:
-{user_text}
 
-Important rules:
-- hair color must match EXACTLY
-- clothes color must match EXACTLY
-- no color variation
-- no style deviation
+STRICT REQUIREMENTS:
+{text}
+
+Rules:
+- hair color EXACT
+- clothes color EXACT
 - no reinterpretation
+- no color deviation
 
-High detail, natural lighting, sharp focus, 8k quality,
-cinematic composition, professional color grading.
+8k, sharp focus, natural light, professional color grading.
 """
 
     negative = """
 wrong hair color,
 wrong clothes color,
 different outfit,
-brunette if blonde requested,
-blue clothes if white requested,
 artistic reinterpretation,
-fantasy style,
 cartoon,
 illustration,
 painting,
 low quality,
 blurry
 """
-    return base.strip(), negative.strip()
+    return prompt.strip(), negative.strip()
 
-# -------------------- BOT SETUP --------------------
+# -------------------- BOT --------------------
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# -------------------- UI --------------------
-def main_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎨 Сгенерировать изображение", callback_data="gen")]
-        ]
-    )
-
-# -------------------- HANDLERS --------------------
 @router.message(CommandStart())
 async def start(message: Message):
     await message.answer(
-        "👋 Отправь описание изображения.\n\n"
+        "👋 Напиши описание изображения.\n\n"
         "Пример:\n"
-        "👉 блондинка в белых шортах на пляже",
-        reply_markup=main_keyboard()
+        "👉 блондинка в белых шортах на пляже"
     )
 
-@router.callback_query(lambda c: c.data == "gen")
-async def generate(callback):
-    await callback.answer("✏️ Напиши описание изображение сообщением")
-
 @router.message()
-async def generate_image(message: Message):
+async def generate(message: Message):
     prompt, negative = enhance_prompt(message.text)
-
     await message.answer("⏳ Генерирую изображение...")
 
     try:
@@ -102,18 +81,18 @@ async def generate_image(message: Message):
         image_url = output[0] if isinstance(output, list) else output.url
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as resp:
-                img = await resp.read()
+            async with session.get(image_url) as r:
+                image_bytes = await r.read()
 
-        photo = BufferedInputFile(img, filename="image.png")
+        photo = BufferedInputFile(image_bytes, filename="image.png")
         await message.answer_photo(photo, caption="✅ Готово")
 
     except Exception as e:
         logging.exception(e)
-        await message.answer("❌ Ошибка генерации. Попробуй изменить описание.")
+        await message.answer("❌ Ошибка генерации")
 
 # -------------------- WEBHOOK --------------------
-async def webhook_handler(request):
+async def handle_update(request):
     data = await request.json()
     await dp.feed_webhook_update(bot, data)
     return web.Response(text="OK")
@@ -128,7 +107,7 @@ async def on_shutdown(app):
 
 # -------------------- APP --------------------
 app = web.Application()
-app.router.add_post("/webhook", webhook_handler)
+app.router.add_post("/", handle_update)  # 👈 ВАЖНО
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 
