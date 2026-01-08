@@ -1,17 +1,14 @@
 import os
 import asyncio
 import logging
+from aiohttp import web
 from dotenv import load_dotenv
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, Update
 
 import replicate
 
-# =======================
-# ENV
-# =======================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -19,17 +16,8 @@ REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 8000))
 
-if not BOT_TOKEN or not REPLICATE_API_TOKEN or not WEBHOOK_URL:
-    raise RuntimeError("❌ Не заданы ENV переменные")
-
-# =======================
-# LOG
-# =======================
 logging.basicConfig(level=logging.INFO)
 
-# =======================
-# BOT
-# =======================
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
@@ -37,32 +25,23 @@ dp.include_router(router)
 
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# =======================
-# START
-# =======================
+# =====================
+# HANDLERS
+# =====================
+
 @router.message(F.text == "/start")
 async def start(message: Message):
-    await message.answer(
-        "👋 Пришли текст — я сгенерирую изображение через Google Imagen-3"
-    )
+    await message.answer("👋 Пришли текст — сгенерирую изображение")
 
-# =======================
-# MESSAGE HANDLER
-# =======================
 @router.message(F.text)
-async def handle_prompt(message: Message):
-    # ❗ ничего долгого здесь
-    asyncio.create_task(generate_and_send_image(message))
+async def prompt_handler(message: Message):
+    asyncio.create_task(generate_image(message))
 
-# =======================
-# IMAGE GENERATION (BACKGROUND)
-# =======================
-async def generate_and_send_image(message: Message):
-    thinking = await message.answer("🎨 Генерирую изображение...")
+async def generate_image(message: Message):
+    wait = await message.answer("🎨 Генерирую изображение...")
 
     try:
         loop = asyncio.get_running_loop()
-
         output = await loop.run_in_executor(
             None,
             lambda: replicate_client.run(
@@ -74,29 +53,26 @@ async def generate_and_send_image(message: Message):
             )
         )
 
-        # Imagen может вернуть список или одиночный FileOutput
-        if isinstance(output, list):
-            image = output[0]
-        else:
-            image = output
+        image = output[0] if isinstance(output, list) else output
+        await message.answer_photo(photo=image.url)
 
-        image_url = image.url
-
-        await message.answer_photo(
-            photo=image_url,
-            caption=message.text
-        )
-
-    except Exception:
-        logging.exception("IMAGE ERROR")
-        await message.answer("❌ Ошибка генерации изображения")
+    except Exception as e:
+        logging.exception(e)
+        await message.answer("❌ Ошибка генерации")
 
     finally:
-        await thinking.delete()
+        await wait.delete()
 
-# =======================
+# =====================
 # WEBHOOK
-# =======================
+# =====================
+
+async def webhook_handler(request: web.Request):
+    data = await request.json()
+    update = Update(**data)
+    await dp.handle_update(bot, update)
+    return web.Response(text="ok")
+
 async def on_startup(app):
     await bot.set_webhook(WEBHOOK_URL)
     logging.info("✅ Webhook установлен")
@@ -105,14 +81,10 @@ async def on_shutdown(app):
     await bot.delete_webhook()
     await bot.session.close()
 
-async def webhook_handler(request: web.Request):
-    update = Update.model_validate(await request.json())
-    await dp.feed_update(bot, update)
-    return web.Response()
-
-# =======================
+# =====================
 # SERVER
-# =======================
+# =====================
+
 def main():
     app = web.Application()
     app.router.add_post("/webhook", webhook_handler)
