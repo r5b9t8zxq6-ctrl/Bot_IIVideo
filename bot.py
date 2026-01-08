@@ -17,7 +17,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # ОБЯЗАТЕЛЬНО с /webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # МОЖЕТ БЫТЬ None
 PORT = int(os.getenv("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO)
@@ -55,10 +55,10 @@ async def start(message: Message):
     await message.answer(
         "🖼 Я умею:\n"
         "— Генерировать изображение по тексту\n"
-        "— Редактировать фото (добавлять / убирать)\n\n"
+        "— Редактировать фото\n\n"
         "Пример:\n"
         "• девушка в черном платье\n"
-        "• (фото) + «убери людей на фоне»"
+        "• (фото) + «убери людей»"
     )
 
 @dp.message(F.photo)
@@ -103,17 +103,24 @@ async def generate_image(message: Message):
 # ─────────────────────────────────────
 # WEB SERVER
 # ─────────────────────────────────────
-async def healthcheck(request):
+async def health(request):
     return web.Response(text="OK")
 
 async def on_startup(app):
-    if not WEBHOOK_URL or not WEBHOOK_URL.startswith("https://"):
-        logging.error("❌ WEBHOOK_URL не задан или не https")
+    if not WEBHOOK_URL:
+        logging.warning("⚠️ WEBHOOK_URL не задан — бот запущен без webhook")
         return
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
+    if not WEBHOOK_URL.startswith("https://"):
+        logging.error("❌ WEBHOOK_URL должен начинаться с https://")
+        return
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(WEBHOOK_URL)
+        logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
+    except Exception as e:
+        logging.exception("❌ Не удалось установить webhook (НЕ КРИТИЧНО)")
 
 async def on_shutdown(app):
     await bot.session.close()
@@ -121,8 +128,8 @@ async def on_shutdown(app):
 def main():
     app = web.Application()
 
-    # 👈 ВАЖНО: корень должен отвечать 200
-    app.router.add_get("/", healthcheck)
+    # Render healthcheck
+    app.router.add_get("/", health)
 
     handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     handler.register(app, path="/webhook")
