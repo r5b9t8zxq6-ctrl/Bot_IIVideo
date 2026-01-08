@@ -91,10 +91,12 @@ async def image_edit(message: Message):
 # ---------- WEBHOOK ----------
 @app.post("/webhook")
 async def webhook(request: Request):
-    data = await request.json()
-    logging.info(f"Incoming update: {data}")
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
+    update = await request.json()
+
+    # ⚠️ НЕ ЖДЁМ ВЫПОЛНЕНИЯ
+    asyncio.create_task(dp.feed_update(bot, update))
+
+    # ⚡ МГНОВЕННЫЙ ОТВЕТ TELEGRAM
     return {"ok": True}
 
 # ---------- HEALTH ----------
