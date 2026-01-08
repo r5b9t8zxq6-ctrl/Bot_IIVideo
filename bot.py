@@ -1,180 +1,222 @@
 import os
 import asyncio
 import logging
-import time
-
-from aiohttp import web
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton
-)
-from aiogram.enums import ParseMode
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from dotenv import load_dotenv
+import aiofiles
 import replicate
+from dotenv import load_dotenv
 
-# ================== НАСТРОЙКИ ==================
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-app.onrender.com/webhook
-WEBHOOK_PATH = "/webhook"
-PORT = int(os.getenv("PORT", 10000))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxx.onrender.com
 
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-logging.basicConfig(level=logging.INFO)
+# ─────────────────────────────
+# 🔒 FIXED IDENTITY (НЕ МЕНЯТЬ)
+# ─────────────────────────────
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
+FIXED_SEED = 284771
 
-# ================== СОСТОЯНИЯ ==================
+IDENTITY_PROFILE = """
+Same person in all images.
 
-user_last_prompt = {}
-user_cooldown = {}
-COOLDOWN = 8  # секунд
-lock = asyncio.Semaphore(1)
+Facial features:
+Oval face shape.
+Soft jawline.
+Straight nose.
+Medium-sized lips.
+Symmetrical face.
+Natural skin texture.
 
-# ================== КНОПКИ ==================
+Eyes:
+Almond-shaped eyes.
+Neutral calm gaze.
 
-def style_keyboard():
+Skin:
+Light natural skin tone.
+No freckles.
+No scars.
+
+IMPORTANT:
+This is the SAME PERSON.
+Face structure MUST NOT change.
+"""
+
+# ─────────────────────────────
+# 🎨 RECOGNITION MAPS
+# ─────────────────────────────
+
+HAIR_MAP = {
+    "блондин": "blonde hair",
+    "блондинка": "blonde hair",
+    "брюнет": "dark brown hair",
+    "брюнетка": "dark brown hair",
+    "рыж": "red hair",
+}
+
+COLOR_MAP = {
+    "бел": "white",
+    "черн": "black",
+    "син": "blue",
+    "красн": "red",
+    "зел": "green",
+    "желт": "yellow",
+}
+
+CLOTHES_MAP = {
+    "шорты": "shorts",
+    "платье": "dress",
+    "курт": "jacket",
+    "футбол": "t-shirt",
+    "кофта": "sweater",
+}
+
+# ─────────────────────────────
+# 🧠 PROMPT ENHANCER
+# ─────────────────────────────
+
+def enhance_prompt(user_text: str):
+    text = user_text.lower()
+
+    hair = "blonde hair"
+    color = "white"
+    clothes = "shorts"
+
+    for k, v in HAIR_MAP.items():
+        if k in text:
+            hair = v
+
+    for k, v in COLOR_MAP.items():
+        if k in text:
+            color = v
+
+    for k, v in CLOTHES_MAP.items():
+        if k in text:
+            clothes = v
+
+    positive_prompt = f"""
+{IDENTITY_PROFILE}
+
+Appearance:
+Hair color is {hair}.
+Hair MUST be {hair}.
+
+Clothing:
+She is wearing {color} {clothes}.
+Clothing MUST be {clothes}.
+Color MUST be {color}.
+
+Photography:
+Ultra realistic professional photo.
+DSLR photo, 85mm lens.
+Shallow depth of field.
+Natural daylight.
+Cinematic lighting.
+High detail skin texture.
+"""
+
+    negative_prompt = """
+different person
+different face
+face change
+age change
+wrong hair color
+brunette, black hair, brown hair, red hair
+wrong clothing
+dress, skirt, jeans, pants, jacket
+cartoon, anime, illustration, 3d
+low quality, blurry
+"""
+
+    return positive_prompt.strip(), negative_prompt.strip()
+
+# ─────────────────────────────
+# 🎛 KEYBOARD
+# ─────────────────────────────
+
+def main_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📸 Реализм", callback_data="style_realistic"),
-                InlineKeyboardButton(text="🎨 Кино", callback_data="style_cinematic")
-            ],
-            [
-                InlineKeyboardButton(text="🧠 Арт", callback_data="style_art"),
-                InlineKeyboardButton(text="✨ Премиум", callback_data="style_premium")
-            ],
-            [
-                InlineKeyboardButton(text="🚀 Сгенерировать", callback_data="generate")
-            ]
+            [InlineKeyboardButton(text="🎨 Сгенерировать изображение", callback_data="gen")],
         ]
     )
 
-# ================== PROMPT BUILDER ==================
+# ─────────────────────────────
+# 🤖 HANDLERS
+# ─────────────────────────────
 
-def build_prompt(text: str, style: str) -> str:
-    base = f"{text}. Ultra high quality, sharp focus, professional photography."
-
-    styles = {
-        "realistic": "photorealistic, natural lighting, DSLR, 85mm lens",
-        "cinematic": "cinematic lighting, shallow depth of field, film still",
-        "art": "artistic composition, painterly style, creative colors",
-        "premium": "luxury editorial style, perfect composition, premium look"
-    }
-
-    return f"{base} {styles.get(style, '')}"
-
-# ================== HANDLERS ==================
-
-@router.message(F.text)
-async def handle_text(message: Message):
-    user_last_prompt[message.from_user.id] = {
-        "text": message.text,
-        "style": "realistic"
-    }
-
+@dp.message(F.text == "/start")
+async def start(message: Message):
     await message.answer(
-        "📝 Текст получен.\nВыбери стиль:",
-        reply_markup=style_keyboard()
+        "🧠 Напиши описание изображения:\n\n"
+        "Пример:\n"
+        "👉 блондинка в белых шортах\n\n"
+        "Я зафиксирую внешность и создам реалистичное фото.",
+        reply_markup=main_keyboard()
     )
 
-@router.callback_query(F.data.startswith("style_"))
-async def select_style(call: CallbackQuery):
-    style = call.data.replace("style_", "")
-    user_last_prompt[call.from_user.id]["style"] = style
+@dp.callback_query(F.data == "gen")
+async def ask_prompt(callback):
+    await callback.message.answer("✍️ Напиши описание (одежда, цвет, образ):")
 
-    await call.answer(f"Стиль выбран: {style}")
+@dp.message(F.text)
+async def generate_image(message: Message):
+    await message.answer("⏳ Генерирую изображение...")
 
-@router.callback_query(F.data == "generate")
-async def generate(call: CallbackQuery):
-    uid = call.from_user.id
-    chat_id = call.message.chat.id
-
-    if uid not in user_last_prompt:
-        await call.answer("Сначала введи текст")
-        return
-
-    now = time.time()
-    if now - user_cooldown.get(uid, 0) < COOLDOWN:
-        await call.answer("⏳ Подожди пару секунд")
-        return
-
-    user_cooldown[uid] = now
-    await call.answer()
-
-    await generate_image(chat_id, uid)
-
-# ================== GENERATION ==================
-
-async def generate_image(chat_id: int, user_id: int):
-    data = user_last_prompt[user_id]
-    prompt = build_prompt(data["text"], data["style"])
-
-    await bot.send_message(chat_id, "⏳ Генерирую изображение...")
-
-    loop = asyncio.get_running_loop()
+    prompt, negative = enhance_prompt(message.text)
 
     try:
-        async with lock:
-            output = await loop.run_in_executor(
-                None,
-                lambda: replicate_client.run(
-                    "ideogram-ai/ideogram-v3-balanced",
-                    input={
-                        "prompt": prompt,
-                        "aspect_ratio": "3:2"
-                    }
-                )
-            )
-
-        # 🔥 ДОСТАЁМ URL ПРАВИЛЬНО
-        if isinstance(output, list):
-            image_url = output[0].url
-        else:
-            image_url = output.url
-
-        await bot.send_photo(
-            chat_id,
-            photo=image_url,
-            caption=f"🎨 Стиль: {data['style']}",
-            reply_markup=style_keyboard()
+        output = replicate_client.run(
+            "ideogram-ai/ideogram-v3-balanced",
+            input={
+                "prompt": prompt,
+                "negative_prompt": negative,
+                "seed": FIXED_SEED,
+                "guidance_scale": 11,
+                "aspect_ratio": "3:2"
+            }
         )
+
+        image_url = output[0]
+        await message.answer_photo(image_url, caption="✅ Готово")
 
     except Exception as e:
         logging.exception(e)
-        await bot.send_message(chat_id, "❌ Ошибка генерации")
+        await message.answer("❌ Ошибка генерации")
 
-# ================== WEBHOOK ==================
+# ─────────────────────────────
+# 🌐 WEBHOOK
+# ─────────────────────────────
 
-async def on_startup(bot: Bot):
-    await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
+async def on_startup(app):
+    await bot.set_webhook(WEBHOOK_URL)
     logging.info("✅ Webhook установлен")
 
-async def on_shutdown(bot: Bot):
+async def on_shutdown(app):
     await bot.delete_webhook()
 
 def main():
     app = web.Application()
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
 
     SimpleRequestHandler(
         dispatcher=dp,
-        bot=bot
-    ).register(app, path=WEBHOOK_PATH)
+        bot=bot,
+    ).register(app, path="/")
 
-    setup_application(app, dp, bot=bot, on_startup=on_startup, on_shutdown=on_shutdown)
-
-    web.run_app(app, port=PORT)
+    setup_application(app, dp, bot=bot)
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
 if __name__ == "__main__":
     main()
