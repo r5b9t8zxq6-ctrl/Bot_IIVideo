@@ -19,7 +19,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 from replicate.exceptions import ReplicateError
 
-# ================== INIT ==================
+# ================= INIT =================
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
@@ -35,31 +35,32 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode="HTML")
 )
 
-# 🔥 ВАЖНО: FSM STORAGE
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 REPLICATE_SEMAPHORE = asyncio.Semaphore(2)
 
-# ================== FSM ==================
+# ================= FSM =================
 class Mode(StatesGroup):
     flux_text = State()
     qwen_text = State()
     qwen_image = State()
+    video_image = State()
 
-# ================== UI ==================
+# ================= UI =================
 def mode_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Fast: Текст → Изображение", callback_data="flux")],
-        [InlineKeyboardButton(text="🎨 Pro: Текст → Изображение", callback_data="qwen_text")],
-        [InlineKeyboardButton(text="🧠 Фото → Фото", callback_data="qwen_image")]
+        [InlineKeyboardButton(text="⚡ Текст → Изображение (Fast)", callback_data="flux")],
+        [InlineKeyboardButton(text="🎨 Текст → Изображение (Pro)", callback_data="qwen_text")],
+        [InlineKeyboardButton(text="🧠 Фото → Фото", callback_data="qwen_image")],
+        [InlineKeyboardButton(text="🎬 Фото → Видео", callback_data="video")]
     ])
 
-# ================== HELPERS ==================
+# ================= HELPERS =================
 def enhance_prompt(text: str) -> str:
     return (
-        "Ultra realistic photo, cinematic lighting, 35mm, high detail. "
+        "Ultra realistic, cinematic lighting, high detail. "
         f"{text}"
     )
 
@@ -73,12 +74,12 @@ def extract_urls(output):
                 urls.append(item.url)
     return urls
 
-async def run_replicate(fn):
+async def run_replicate(fn, timeout=300):
     async with REPLICATE_SEMAPHORE:
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(fn),
-                timeout=120
+                timeout=timeout
             )
         except asyncio.TimeoutError:
             logging.error("Replicate timeout")
@@ -88,20 +89,20 @@ async def run_replicate(fn):
             logging.exception("Unknown replicate error")
         return None
 
-# ================== START ==================
+# ================= START =================
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Выбери режим генерации 👇",
+        "Выбери режим 👇",
         reply_markup=mode_keyboard()
     )
 
-# ================== CALLBACKS ==================
+# ================= CALLBACKS =================
 @dp.callback_query(F.data == "flux")
 async def cb_flux(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Mode.flux_text)
-    await callback.message.answer("✍️ Напиши текст (Fast генерация)")
+    await callback.message.answer("✍️ Напиши текст")
     await callback.answer()
 
 @dp.callback_query(F.data == "qwen_text")
@@ -116,10 +117,16 @@ async def cb_qwen_image(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("🖼 Отправь фото + описание")
     await callback.answer()
 
-# ================== FLUX ==================
+@dp.callback_query(F.data == "video")
+async def cb_video(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Mode.video_image)
+    await callback.message.answer("🎬 Отправь фото + описание движения")
+    await callback.answer()
+
+# ================= FLUX =================
 @dp.message(Mode.flux_text, F.text)
 async def flux_text(message: Message):
-    await message.answer("⚡ Генерирую...")
+    await message.answer("⚡ Генерирую изображение...")
 
     def gen():
         return replicate_client.run(
@@ -129,16 +136,15 @@ async def flux_text(message: Message):
 
     result = await run_replicate(gen)
 
-    if not result:
+    if result:
+        await message.answer_photo(result.url)
+    else:
         await message.answer("❌ Ошибка генерации")
-        return
 
-    await message.answer_photo(result.url)
-
-# ================== QWEN TEXT ==================
+# ================= QWEN TEXT =================
 @dp.message(Mode.qwen_text, F.text)
 async def qwen_text(message: Message):
-    await message.answer("🎨 Генерирую...")
+    await message.answer("🎨 Генерирую изображение...")
 
     def gen():
         return replicate_client.run(
@@ -159,7 +165,7 @@ async def qwen_text(message: Message):
     for url in extract_urls(result):
         await message.answer_photo(url)
 
-# ================== QWEN IMAGE ==================
+# ================= QWEN IMAGE =================
 @dp.message(Mode.qwen_image, F.photo)
 async def qwen_image(message: Message):
     await message.answer("🧠 Обрабатываю фото...")
@@ -187,7 +193,35 @@ async def qwen_image(message: Message):
     for url in extract_urls(result):
         await message.answer_photo(url)
 
-# ================== FASTAPI ==================
+# ================= VIDEO (KLING) =================
+@dp.message(Mode.video_image, F.photo)
+async def image_to_video(message: Message):
+    await message.answer("🎬 Генерирую видео (это может занять до 2 минут)...")
+
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+
+    prompt = message.caption or "Smooth cinematic motion"
+
+    def gen():
+        return replicate_client.run(
+            "kwaivgi/kling-v2.5-turbo-pro",
+            input={
+                "image": image_url,
+                "prompt": prompt
+            }
+        )
+
+    result = await run_replicate(gen, timeout=420)
+
+    if not result:
+        await message.answer("❌ Ошибка генерации видео")
+        return
+
+    await message.answer_video(result.url)
+
+# ================= FASTAPI =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot.set_webhook(
@@ -207,7 +241,7 @@ async def telegram_webhook(request: Request):
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-# ================== RUN ==================
+# ================= RUN =================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
