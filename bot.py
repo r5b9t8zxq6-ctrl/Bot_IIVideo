@@ -60,20 +60,18 @@ async def text_to_image(message: Message):
             },
         )
 
-    try:
-        output = await asyncio.to_thread(generate)
-        urls = extract_urls(output)
+    result = await run_replicate(generate)
 
-        if not urls:
-            await message.answer("❌ Модель не вернула изображение")
-            return
+    if result == "RATE_LIMIT":
+        await message.answer("⏳ Слишком много запросов. Подожди 10 секунд.")
+        return
 
-        for url in urls:
-            await message.answer_photo(url)
-
-    except Exception:
-        logging.exception("TEXT2IMG ERROR")
+    if not result:
         await message.answer("❌ Ошибка генерации изображения")
+        return
+
+    for url in result:
+        await message.answer_photo(url)
 
         # 🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
         images = []
@@ -95,40 +93,32 @@ async def text_to_image(message: Message):
         await message.answer("❌ Ошибка генерации")
 
 # ---------- IMAGE → IMAGE ----------
-@dp.message(lambda m: m.photo)
-async def image_edit(message: Message):
-    await message.answer("🧠 Обрабатываю фото...")
-
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-
-    prompt = message.caption or "Improve photo quality"
+@dp.message(lambda m: m.text and not m.photo)
+async def text_to_image(message: Message):
+    await message.answer("🎨 Генерирую изображение...")
 
     def generate():
         return replicate_client.run(
             "qwen/qwen-image-edit-2511",
             input={
-                "image": [image_url],
-                "prompt": enhance_prompt(prompt),
+                "image": [],
+                "prompt": enhance_prompt(message.text),
                 "aspect_ratio": "3:4",
             },
         )
 
-    try:
-        output = await asyncio.to_thread(generate)
-        urls = extract_urls(output)
+    result = await run_replicate(generate)
 
-        if not urls:
-            await message.answer("❌ Модель не вернула изображение")
-            return
+    if result == "RATE_LIMIT":
+        await message.answer("⏳ Слишком много запросов. Подожди 10 секунд.")
+        return
 
-        for url in urls:
-            await message.answer_photo(url)
+    if not result:
+        await message.answer("❌ Ошибка генерации изображения")
+        return
 
-    except Exception:
-        logging.exception("IMG2IMG ERROR")
-        await message.answer("❌ Ошибка обработки изображения")
+    for url in result:
+        await message.answer_photo(url)
 
 # ---------- WEBHOOK ----------
 @app.post(WEBHOOK_PATH)
