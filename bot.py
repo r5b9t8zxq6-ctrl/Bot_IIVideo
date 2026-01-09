@@ -62,10 +62,24 @@ async def text_to_image(message: Message):
 
     try:
         output = await asyncio.to_thread(generate)
-        for item in output:
-            await message.answer_photo(item.url)
+
+        # 🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
+        images = []
+
+        if isinstance(output, dict):
+            images = output.get("images", [])
+        elif isinstance(output, list):
+            images = output
+
+        if not images:
+            await message.answer("❌ Модель не вернула изображение")
+            return
+
+        for url in images:
+            await message.answer_photo(url)
+
     except Exception as e:
-        logging.exception(e)
+        logging.exception("TEXT2IMG ERROR")
         await message.answer("❌ Ошибка генерации")
 
 # ---------- IMAGE → IMAGE ----------
@@ -91,10 +105,23 @@ async def image_edit(message: Message):
 
     try:
         output = await asyncio.to_thread(generate)
-        for item in output:
-            await message.answer_photo(item.url)
+
+        images = []
+
+        if isinstance(output, dict):
+            images = output.get("images", [])
+        elif isinstance(output, list):
+            images = output
+
+        if not images:
+            await message.answer("❌ Модель не вернула изображение")
+            return
+
+        for url in images:
+            await message.answer_photo(url)
+
     except Exception as e:
-        logging.exception(e)
+        logging.exception("IMG2IMG ERROR")
         await message.answer("❌ Ошибка обработки изображения")
 
 # ---------- WEBHOOK ----------
