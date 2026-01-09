@@ -1,24 +1,18 @@
 import os
-import asyncio
 import logging
+import aiohttp
+import replicate
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
 
-import replicate
-import aiohttp
-
-# ================== НАСТРОЙКИ ==================
+# ================== ENV ==================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://bot-iivideo.onrender.com/webhook
@@ -28,12 +22,14 @@ os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
 logging.basicConfig(level=logging.INFO)
 
-# ================== BOT / DISPATCHER ==================
+# ================== BOT ==================
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 
+dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
@@ -46,7 +42,7 @@ app = FastAPI()
 class VideoFSM(StatesGroup):
     waiting_prompt = State()
 
-# ================== КЛАВИАТУРЫ ==================
+# ================== KEYBOARDS ==================
 
 main_kb = InlineKeyboardMarkup(
     inline_keyboard=[
@@ -60,42 +56,36 @@ main_kb = InlineKeyboardMarkup(
 async def start(message: Message):
     await message.answer(
         "Привет 👋\n\nНажми кнопку ниже, чтобы сгенерировать видео 🎬",
-        reply_markup=main_kb,
+        reply_markup=main_kb
     )
-
 
 @router.callback_query(F.data == "gen_video")
-async def gen_video(callback: CallbackQuery, state: FSMContext):
+async def ask_prompt(callback: CallbackQuery, state: FSMContext):
     await state.set_state(VideoFSM.waiting_prompt)
-    await callback.message.answer(
-        "✍️ Опиши видео (например: <i>a woman is dancing</i>)"
-    )
+    await callback.message.answer("✍️ Напиши описание видео\n<i>Например: a woman is dancing</i>")
     await callback.answer()
 
-
 @router.message(VideoFSM.waiting_prompt)
-async def process_prompt(message: Message, state: FSMContext):
-    prompt = message.text
+async def generate_video(message: Message, state: FSMContext):
     await state.clear()
-
-    await message.answer("⏳ Генерирую видео, это может занять 1–2 минуты...")
+    await message.answer("⏳ Генерирую видео, подожди 1–2 минуты...")
 
     try:
         output = replicate.run(
             "kwaivgi/kling-v2.5-turbo-pro",
-            input={"prompt": prompt},
+            input={"prompt": message.text}
         )
 
         video_url = output.url
 
         async with aiohttp.ClientSession() as session:
             async with session.get(video_url) as resp:
-                video_bytes = await resp.read()
+                video = await resp.read()
 
         await message.answer_video(
-            video=video_bytes,
-            caption="🎉 Готово!\n\nХочешь ещё одно видео?",
-            reply_markup=main_kb,
+            video=video,
+            caption="🎉 Готово! Хочешь ещё?",
+            reply_markup=main_kb
         )
 
     except Exception as e:
@@ -105,23 +95,21 @@ async def process_prompt(message: Message, state: FSMContext):
 # ================== WEBHOOK ==================
 
 @app.on_event("startup")
-async def on_startup():
+async def startup():
     await bot.set_webhook(WEBHOOK_URL)
     logging.info("✅ Webhook установлен")
 
-
 @app.on_event("shutdown")
-async def on_shutdown():
+async def shutdown():
     await bot.session.close()
 
-
 @app.post("/webhook")
-async def webhook(request: Request):
+async def telegram_webhook(request: Request):
     update = await request.json()
     await dp.feed_raw_update(bot, update)
-    return {"status": "ok"}
+    return {"ok": True}
 
-# ================== LOCAL RUN (НЕ ДЛЯ RENDER) ==================
+# ================== LOCAL ==================
 
 if __name__ == "__main__":
     import uvicorn
