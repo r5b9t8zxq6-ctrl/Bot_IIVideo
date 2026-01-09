@@ -18,7 +18,7 @@ from aiogram.fsm.state import StatesGroup, State
 from dotenv import load_dotenv
 from replicate.exceptions import ReplicateError
 
-# ---------- INIT ----------
+# ================== INIT ==================
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
@@ -27,7 +27,7 @@ REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN or not REPLICATE_API_TOKEN or not WEBHOOK_URL:
-    raise RuntimeError("ENV variables missing")
+    raise RuntimeError("❌ Missing ENV variables")
 
 bot = Bot(
     token=BOT_TOKEN,
@@ -36,15 +36,17 @@ bot = Bot(
 
 dp = Dispatcher()
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
+
+# защита от перегруза Replicate
 REPLICATE_SEMAPHORE = asyncio.Semaphore(2)
 
-# ---------- FSM ----------
+# ================== FSM ==================
 class Mode(StatesGroup):
     flux_text = State()
     qwen_text = State()
     qwen_image = State()
 
-# ---------- UI ----------
+# ================== UI ==================
 def mode_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚡ Fast: Текст → Изображение", callback_data="flux")],
@@ -52,10 +54,10 @@ def mode_keyboard():
         [InlineKeyboardButton(text="🧠 Фото → Фото", callback_data="qwen_image")]
     ])
 
-# ---------- HELPERS ----------
+# ================== HELPERS ==================
 def enhance_prompt(text: str) -> str:
     return (
-        "Ultra realistic photo, cinematic light, 35mm, high detail. "
+        "Ultra realistic photo, cinematic lighting, 35mm, high detail. "
         f"{text}"
     )
 
@@ -77,14 +79,14 @@ async def run_replicate(fn):
                 timeout=120
             )
         except asyncio.TimeoutError:
-            logging.error("Replicate timeout")
+            logging.error("⏱ Replicate timeout")
         except ReplicateError as e:
             logging.error(f"Replicate error: {e}")
         except Exception:
             logging.exception("Unknown replicate error")
         return None
 
-# ---------- START ----------
+# ================== START ==================
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
@@ -93,11 +95,11 @@ async def start(message: Message, state: FSMContext):
         reply_markup=mode_keyboard()
     )
 
-# ---------- CALLBACKS ----------
+# ================== CALLBACKS ==================
 @dp.callback_query(F.data == "flux")
 async def cb_flux(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Mode.flux_text)
-    await callback.message.answer("✍️ Напиши текст (Fast генерация)")
+    await callback.message.answer("✍️ Напиши текст (быстрая генерация)")
     await callback.answer()
 
 @dp.callback_query(F.data == "qwen_text")
@@ -112,10 +114,10 @@ async def cb_qwen_image(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("🖼 Отправь фото + описание")
     await callback.answer()
 
-# ---------- FLUX FAST ----------
+# ================== FLUX FAST ==================
 @dp.message(Mode.flux_text, F.text)
 async def flux_text_to_image(message: Message):
-    await message.answer("⚡ Генерирую (Fast)...")
+    await message.answer("⚡ Генерирую изображение...")
 
     def gen():
         return replicate_client.run(
@@ -131,7 +133,7 @@ async def flux_text_to_image(message: Message):
 
     await message.answer_photo(result.url)
 
-# ---------- QWEN TEXT ----------
+# ================== QWEN TEXT ==================
 @dp.message(Mode.qwen_text, F.text)
 async def qwen_text_to_image(message: Message):
     await message.answer("🎨 Генерирую изображение...")
@@ -155,7 +157,7 @@ async def qwen_text_to_image(message: Message):
     for url in extract_urls(result):
         await message.answer_photo(url)
 
-# ---------- QWEN IMAGE ----------
+# ================== QWEN IMAGE ==================
 @dp.message(Mode.qwen_image, F.photo)
 async def qwen_image_to_image(message: Message):
     await message.answer("🧠 Обрабатываю изображение...")
@@ -183,17 +185,15 @@ async def qwen_image_to_image(message: Message):
     for url in extract_urls(result):
         await message.answer_photo(url)
 
-# ---------- FASTAPI / WEBHOOK ----------
+# ================== FASTAPI / WEBHOOK ==================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot.set_webhook(
         url=f"{WEBHOOK_URL}/webhook",
         drop_pending_updates=True
     )
-    await dp.startup(bot)
-    logging.info("Webhook установлен")
+    logging.info("✅ Webhook установлен")
     yield
-    await dp.shutdown(bot)
     await bot.delete_webhook()
     await bot.session.close()
 
@@ -205,7 +205,7 @@ async def telegram_webhook(request: Request):
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-# ---------- RUN ----------
+# ================== RUN ==================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
