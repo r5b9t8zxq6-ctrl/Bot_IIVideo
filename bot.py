@@ -3,9 +3,8 @@ import logging
 import asyncio
 import replicate
 
-from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message, Update
+from aiogram.types import Message
 from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
@@ -17,13 +16,9 @@ logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN or not REPLICATE_API_TOKEN:
     raise RuntimeError("BOT_TOKEN или REPLICATE_API_TOKEN не заданы")
-
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = "https://bot-iivideo.onrender.com/webhook"
 
 bot = Bot(
     token=BOT_TOKEN,
@@ -31,8 +26,6 @@ bot = Bot(
 )
 
 dp = Dispatcher()
-app = FastAPI()
-
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
 # ---------- PROMPT ----------
@@ -58,7 +51,6 @@ def extract_urls(output):
         images = output.get("images", [])
 
     return images
-
 
 async def run_replicate(generate_func):
     try:
@@ -150,31 +142,11 @@ async def image_to_image(message: Message):
     for url in result:
         await message.answer_photo(url)
 
-# ---------- WEBHOOK ----------
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    update = Update.model_validate(await request.json())
-    await dp.feed_update(bot, update)
-    return {"ok": True}
-
-# ---------- HEALTH ----------
-@app.get("/")
-async def health():
-    return {"status": "ok"}
-
-# ---------- LIFECYCLE ----------
-@app.on_event("startup")
-async def on_startup():
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL)
-    logging.info("Webhook установлен")
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    await bot.delete_webhook()
-    await bot.session.close()
-
 # ---------- RUN ----------
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("Запуск в режиме polling...")
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    asyncio.run(main())
