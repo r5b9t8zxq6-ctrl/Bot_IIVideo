@@ -8,6 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import Message, Update
 from aiogram.filters import CommandStart
 from dotenv import load_dotenv
+from replicate.exceptions import ReplicateError
 
 # ---------- INIT ----------
 load_dotenv()
@@ -36,6 +37,40 @@ def enhance_prompt(text: str) -> str:
         f"{text}. "
         "Natural lighting, 35mm, high detail, cinematic realism."
     )
+
+# ---------- REPLICATE RUNNER ----------
+def extract_urls(output):
+    images = []
+
+    if isinstance(output, list):
+        for item in output:
+            if hasattr(item, "url"):
+                images.append(item.url)
+            elif isinstance(item, str):
+                images.append(item)
+
+    elif isinstance(output, dict):
+        images = output.get("images", [])
+
+    return images
+
+
+async def run_replicate(generate_func):
+    try:
+        output = await asyncio.to_thread(generate_func)
+        images = extract_urls(output)
+        return images
+
+    except ReplicateError as e:
+        if "429" in str(e):
+            return "RATE_LIMIT"
+        logging.exception("Replicate API error")
+        return None
+
+    except Exception:
+        logging.exception("Unknown replicate error")
+        return None
+
 
 # ---------- START ----------
 @dp.message(CommandStart())
@@ -73,36 +108,23 @@ async def text_to_image(message: Message):
     for url in result:
         await message.answer_photo(url)
 
-        # 🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
-        images = []
-
-        if isinstance(output, dict):
-            images = output.get("images", [])
-        elif isinstance(output, list):
-            images = output
-
-        if not images:
-            await message.answer("❌ Модель не вернула изображение")
-            return
-
-        for url in images:
-            await message.answer_photo(url)
-
-    except Exception as e:
-        logging.exception("TEXT2IMG ERROR")
-        await message.answer("❌ Ошибка генерации")
-
 # ---------- IMAGE → IMAGE ----------
-@dp.message(lambda m: m.text and not m.photo)
-async def text_to_image(message: Message):
-    await message.answer("🎨 Генерирую изображение...")
+@dp.message(lambda m: m.photo)
+async def image_to_image(message: Message):
+    await message.answer("🧠 Обрабатываю изображение...")
+
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+
+    prompt = message.caption or "Improve photo quality"
 
     def generate():
         return replicate_client.run(
             "qwen/qwen-image-edit-2511",
             input={
-                "image": [],
-                "prompt": enhance_prompt(message.text),
+                "image": [image_url],
+                "prompt": enhance_prompt(prompt),
                 "aspect_ratio": "3:4",
             },
         )
@@ -114,7 +136,7 @@ async def text_to_image(message: Message):
         return
 
     if not result:
-        await message.answer("❌ Ошибка генерации изображения")
+        await message.answer("❌ Ошибка обработки изображения")
         return
 
     for url in result:
@@ -125,10 +147,7 @@ async def text_to_image(message: Message):
 async def webhook(request: Request):
     update_data = await request.json()
     update = Update.model_validate(update_data)
-
-    # ⚠️ ВАЖНО: НЕ create_task
     await dp.feed_update(bot, update)
-
     return {"ok": True}
 
 # ---------- HEALTH ----------
