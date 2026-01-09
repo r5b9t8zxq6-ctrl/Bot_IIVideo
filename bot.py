@@ -6,9 +6,15 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, Update
+from aiogram.types import (
+    Message, Update,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery
+)
 from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 from dotenv import load_dotenv
 from replicate.exceptions import ReplicateError
 
@@ -32,11 +38,25 @@ dp = Dispatcher()
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 REPLICATE_SEMAPHORE = asyncio.Semaphore(2)
 
+# ---------- FSM ----------
+class Mode(StatesGroup):
+    flux_text = State()
+    qwen_text = State()
+    qwen_image = State()
+
+# ---------- UI ----------
+def mode_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Fast: Текст → Изображение", callback_data="flux")],
+        [InlineKeyboardButton(text="🎨 Pro: Текст → Изображение", callback_data="qwen_text")],
+        [InlineKeyboardButton(text="🧠 Фото → Фото", callback_data="qwen_image")]
+    ])
+
 # ---------- HELPERS ----------
 def enhance_prompt(text: str) -> str:
     return (
-        "Ultra realistic photo. "
-        f"{text}. Natural lighting, 35mm, cinematic realism."
+        "Ultra realistic photo, cinematic light, 35mm, high detail. "
+        f"{text}"
     )
 
 def extract_urls(output):
@@ -57,22 +77,63 @@ async def run_replicate(fn):
                 timeout=120
             )
         except asyncio.TimeoutError:
-            logging.error("⏱ Replicate timeout")
+            logging.error("Replicate timeout")
         except ReplicateError as e:
             logging.error(f"Replicate error: {e}")
-            if "429" in str(e):
-                return "RATE_LIMIT"
         except Exception:
             logging.exception("Unknown replicate error")
         return None
 
-# ---------- HANDLERS ----------
+# ---------- START ----------
 @dp.message(CommandStart())
-async def start(message: Message):
-    await message.answer("🖼 Напиши текст или отправь фото")
+async def start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Выбери режим генерации 👇",
+        reply_markup=mode_keyboard()
+    )
 
-@dp.message(F.text)
-async def text_to_image(message: Message):
+# ---------- CALLBACKS ----------
+@dp.callback_query(F.data == "flux")
+async def cb_flux(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Mode.flux_text)
+    await callback.message.answer("✍️ Напиши текст (Fast генерация)")
+    await callback.answer()
+
+@dp.callback_query(F.data == "qwen_text")
+async def cb_qwen_text(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Mode.qwen_text)
+    await callback.message.answer("🎨 Опиши сцену")
+    await callback.answer()
+
+@dp.callback_query(F.data == "qwen_image")
+async def cb_qwen_image(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Mode.qwen_image)
+    await callback.message.answer("🖼 Отправь фото + описание")
+    await callback.answer()
+
+# ---------- FLUX FAST ----------
+@dp.message(Mode.flux_text, F.text)
+async def flux_text_to_image(message: Message):
+    await message.answer("⚡ Генерирую (Fast)...")
+
+    def gen():
+        return replicate_client.run(
+            "prunaai/flux-fast",
+            input={"prompt": message.text}
+        )
+
+    result = await run_replicate(gen)
+
+    if not result:
+        await message.answer("❌ Ошибка генерации")
+        return
+
+    await message.answer_photo(result.url)
+
+# ---------- QWEN TEXT ----------
+@dp.message(Mode.qwen_text, F.text)
+async def qwen_text_to_image(message: Message):
     await message.answer("🎨 Генерирую изображение...")
 
     def gen():
@@ -81,15 +142,11 @@ async def text_to_image(message: Message):
             input={
                 "image": [],
                 "prompt": enhance_prompt(message.text),
-                "aspect_ratio": "3:4",
-            },
+                "aspect_ratio": "3:4"
+            }
         )
 
     result = await run_replicate(gen)
-
-    if result == "RATE_LIMIT":
-        await message.answer("⏳ Слишком много запросов")
-        return
 
     if not result:
         await message.answer("❌ Ошибка генерации")
@@ -98,8 +155,9 @@ async def text_to_image(message: Message):
     for url in extract_urls(result):
         await message.answer_photo(url)
 
-@dp.message(F.photo)
-async def image_to_image(message: Message):
+# ---------- QWEN IMAGE ----------
+@dp.message(Mode.qwen_image, F.photo)
+async def qwen_image_to_image(message: Message):
     await message.answer("🧠 Обрабатываю изображение...")
 
     photo = message.photo[-1]
@@ -112,8 +170,8 @@ async def image_to_image(message: Message):
             input={
                 "image": [image_url],
                 "prompt": enhance_prompt(message.caption or "Improve photo"),
-                "aspect_ratio": "3:4",
-            },
+                "aspect_ratio": "3:4"
+            }
         )
 
     result = await run_replicate(gen)
@@ -125,15 +183,15 @@ async def image_to_image(message: Message):
     for url in extract_urls(result):
         await message.answer_photo(url)
 
-# ---------- FASTAPI + WEBHOOK ----------
+# ---------- FASTAPI / WEBHOOK ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot.set_webhook(
         url=f"{WEBHOOK_URL}/webhook",
         drop_pending_updates=True
     )
-    await dp.startup(bot)   # 🔥 ВАЖНО
-    logging.info("✅ Webhook установлен и dispatcher запущен")
+    await dp.startup(bot)
+    logging.info("Webhook установлен")
     yield
     await dp.shutdown(bot)
     await bot.delete_webhook()
@@ -153,5 +211,5 @@ if __name__ == "__main__":
     uvicorn.run(
         "bot:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
+        port=int(os.getenv("PORT", 10000))
     )
