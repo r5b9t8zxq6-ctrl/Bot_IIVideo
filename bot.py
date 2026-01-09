@@ -27,23 +27,10 @@ bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode="HTML")
 )
+
 dp = Dispatcher()
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 REPLICATE_SEMAPHORE = asyncio.Semaphore(2)
-
-# ---------- LIFESPAN ----------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await bot.set_webhook(
-        url=f"{WEBHOOK_URL}/webhook",
-        drop_pending_updates=True
-    )
-    logging.info("✅ Webhook установлен")
-    yield
-    await bot.delete_webhook()
-    await bot.session.close()
-
-app = FastAPI(lifespan=lifespan)
 
 # ---------- HELPERS ----------
 def enhance_prompt(text: str) -> str:
@@ -53,11 +40,14 @@ def enhance_prompt(text: str) -> str:
     )
 
 def extract_urls(output):
-    return [
-        i if isinstance(i, str) else i.url
-        for i in output or []
-        if isinstance(i, (str, object))
-    ]
+    urls = []
+    if isinstance(output, list):
+        for item in output:
+            if isinstance(item, str):
+                urls.append(item)
+            elif hasattr(item, "url"):
+                urls.append(item.url)
+    return urls
 
 async def run_replicate(fn):
     async with REPLICATE_SEMAPHORE:
@@ -66,11 +56,14 @@ async def run_replicate(fn):
                 asyncio.to_thread(fn),
                 timeout=120
             )
+        except asyncio.TimeoutError:
+            logging.error("⏱ Replicate timeout")
         except ReplicateError as e:
+            logging.error(f"Replicate error: {e}")
             if "429" in str(e):
                 return "RATE_LIMIT"
         except Exception:
-            logging.exception("Replicate error")
+            logging.exception("Unknown replicate error")
         return None
 
 # ---------- HANDLERS ----------
@@ -80,7 +73,7 @@ async def start(message: Message):
 
 @dp.message(F.text)
 async def text_to_image(message: Message):
-    await message.answer("🎨 Генерирую...")
+    await message.answer("🎨 Генерирую изображение...")
 
     def gen():
         return replicate_client.run(
@@ -93,8 +86,13 @@ async def text_to_image(message: Message):
         )
 
     result = await run_replicate(gen)
+
+    if result == "RATE_LIMIT":
+        await message.answer("⏳ Слишком много запросов")
+        return
+
     if not result:
-        await message.answer("❌ Ошибка")
+        await message.answer("❌ Ошибка генерации")
         return
 
     for url in extract_urls(result):
@@ -102,7 +100,7 @@ async def text_to_image(message: Message):
 
 @dp.message(F.photo)
 async def image_to_image(message: Message):
-    await message.answer("🧠 Обрабатываю...")
+    await message.answer("🧠 Обрабатываю изображение...")
 
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
@@ -119,14 +117,30 @@ async def image_to_image(message: Message):
         )
 
     result = await run_replicate(gen)
+
     if not result:
-        await message.answer("❌ Ошибка")
+        await message.answer("❌ Ошибка обработки")
         return
 
     for url in extract_urls(result):
         await message.answer_photo(url)
 
-# ---------- WEBHOOK ----------
+# ---------- FASTAPI + WEBHOOK ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await bot.set_webhook(
+        url=f"{WEBHOOK_URL}/webhook",
+        drop_pending_updates=True
+    )
+    await dp.startup(bot)   # 🔥 ВАЖНО
+    logging.info("✅ Webhook установлен и dispatcher запущен")
+    yield
+    await dp.shutdown(bot)
+    await bot.delete_webhook()
+    await bot.session.close()
+
+app = FastAPI(lifespan=lifespan)
+
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     update = Update.model_validate(await request.json())
