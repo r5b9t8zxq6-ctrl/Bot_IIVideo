@@ -10,6 +10,7 @@ from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 from replicate.exceptions import ReplicateError
+from contextlib import asynccontextmanager
 
 # ---------- INIT ----------
 load_dotenv()
@@ -143,18 +144,18 @@ async def telegram_webhook(request: Request):
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     await bot.set_webhook(
         url=f"{WEBHOOK_URL}/webhook",
         drop_pending_updates=True
     )
     logging.info("✅ Webhook установлен")
-
-@app.on_event("shutdown")
-async def on_shutdown():
+    yield
     await bot.delete_webhook()
     await bot.session.close()
+
+app = FastAPI(lifespan=lifespan)
 
 # ---------- RUN ----------
 if __name__ == "__main__":
