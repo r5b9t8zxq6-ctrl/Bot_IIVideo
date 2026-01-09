@@ -15,6 +15,7 @@ from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 from replicate.exceptions import ReplicateError
 
@@ -27,17 +28,18 @@ REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN or not REPLICATE_API_TOKEN or not WEBHOOK_URL:
-    raise RuntimeError("❌ Missing ENV variables")
+    raise RuntimeError("Missing ENV variables")
 
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode="HTML")
 )
 
-dp = Dispatcher()
-replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
+# 🔥 ВАЖНО: FSM STORAGE
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
-# защита от перегруза Replicate
+replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 REPLICATE_SEMAPHORE = asyncio.Semaphore(2)
 
 # ================== FSM ==================
@@ -79,7 +81,7 @@ async def run_replicate(fn):
                 timeout=120
             )
         except asyncio.TimeoutError:
-            logging.error("⏱ Replicate timeout")
+            logging.error("Replicate timeout")
         except ReplicateError as e:
             logging.error(f"Replicate error: {e}")
         except Exception:
@@ -99,7 +101,7 @@ async def start(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "flux")
 async def cb_flux(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Mode.flux_text)
-    await callback.message.answer("✍️ Напиши текст (быстрая генерация)")
+    await callback.message.answer("✍️ Напиши текст (Fast генерация)")
     await callback.answer()
 
 @dp.callback_query(F.data == "qwen_text")
@@ -114,10 +116,10 @@ async def cb_qwen_image(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("🖼 Отправь фото + описание")
     await callback.answer()
 
-# ================== FLUX FAST ==================
+# ================== FLUX ==================
 @dp.message(Mode.flux_text, F.text)
-async def flux_text_to_image(message: Message):
-    await message.answer("⚡ Генерирую изображение...")
+async def flux_text(message: Message):
+    await message.answer("⚡ Генерирую...")
 
     def gen():
         return replicate_client.run(
@@ -135,8 +137,8 @@ async def flux_text_to_image(message: Message):
 
 # ================== QWEN TEXT ==================
 @dp.message(Mode.qwen_text, F.text)
-async def qwen_text_to_image(message: Message):
-    await message.answer("🎨 Генерирую изображение...")
+async def qwen_text(message: Message):
+    await message.answer("🎨 Генерирую...")
 
     def gen():
         return replicate_client.run(
@@ -151,7 +153,7 @@ async def qwen_text_to_image(message: Message):
     result = await run_replicate(gen)
 
     if not result:
-        await message.answer("❌ Ошибка генерации")
+        await message.answer("❌ Ошибка")
         return
 
     for url in extract_urls(result):
@@ -159,8 +161,8 @@ async def qwen_text_to_image(message: Message):
 
 # ================== QWEN IMAGE ==================
 @dp.message(Mode.qwen_image, F.photo)
-async def qwen_image_to_image(message: Message):
-    await message.answer("🧠 Обрабатываю изображение...")
+async def qwen_image(message: Message):
+    await message.answer("🧠 Обрабатываю фото...")
 
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
@@ -179,13 +181,13 @@ async def qwen_image_to_image(message: Message):
     result = await run_replicate(gen)
 
     if not result:
-        await message.answer("❌ Ошибка обработки")
+        await message.answer("❌ Ошибка")
         return
 
     for url in extract_urls(result):
         await message.answer_photo(url)
 
-# ================== FASTAPI / WEBHOOK ==================
+# ================== FASTAPI ==================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot.set_webhook(
