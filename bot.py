@@ -9,16 +9,19 @@ from aiogram.types import Message, Update
 from aiogram.filters import CommandStart
 from dotenv import load_dotenv
 
+# ---------- INIT ----------
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+PORT = int(os.getenv("PORT", 10000))
 
-# ⚠️ ЖЁСТКО задаём webhook
+if not BOT_TOKEN or not REPLICATE_API_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN или REPLICATE_API_TOKEN не заданы")
+
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = "https://bot-iivideo.onrender.com/webhook"
-PORT = int(os.getenv("PORT", 10000))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -28,13 +31,13 @@ replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
 # ---------- PROMPT ----------
 def enhance_prompt(text: str) -> str:
-    return f"""
-Ultra realistic photo.
-{text}
-Natural lighting, 35mm photo, high detail, cinematic realism.
-"""
+    return (
+        "Ultra realistic photo. "
+        f"{text}. "
+        "Natural lighting, 35mm, high detail, cinematic realism."
+    )
 
-# ---------- COMMAND ----------
+# ---------- START ----------
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
@@ -53,14 +56,17 @@ async def text_to_image(message: Message):
             input={
                 "image": [],
                 "prompt": enhance_prompt(message.text),
-                "aspect_ratio": "3:4"
-            }
+                "aspect_ratio": "3:4",
+            },
         )
 
-    output = await asyncio.to_thread(generate)
-
-    for item in output:
-        await message.answer_photo(item.url)
+    try:
+        output = await asyncio.to_thread(generate)
+        for item in output:
+            await message.answer_photo(item.url)
+    except Exception as e:
+        logging.exception(e)
+        await message.answer("❌ Ошибка генерации")
 
 # ---------- IMAGE → IMAGE ----------
 @dp.message(lambda m: m.photo)
@@ -79,23 +85,26 @@ async def image_edit(message: Message):
             input={
                 "image": [image_url],
                 "prompt": enhance_prompt(prompt),
-                "aspect_ratio": "3:4"
-            }
+                "aspect_ratio": "3:4",
+            },
         )
 
-    output = await asyncio.to_thread(generate)
-
-    for item in output:
-        await message.answer_photo(item.url)
+    try:
+        output = await asyncio.to_thread(generate)
+        for item in output:
+            await message.answer_photo(item.url)
+    except Exception as e:
+        logging.exception(e)
+        await message.answer("❌ Ошибка обработки изображения")
 
 # ---------- WEBHOOK ----------
-@app.post("/webhook")
+@app.post(WEBHOOK_PATH)
 async def webhook(request: Request):
-    data = await request.json()
+    update_data = await request.json()
+    update = Update.model_validate(update_data)
 
-    update = Update.model_validate(data)
-
-    asyncio.create_task(dp.feed_update(bot, update))
+    # ⚠️ ВАЖНО: НЕ create_task
+    await dp.feed_update(bot, update)
 
     return {"ok": True}
 
@@ -114,6 +123,7 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     await bot.delete_webhook()
+    await bot.session.close()
 
 # ---------- RUN ----------
 if __name__ == "__main__":
