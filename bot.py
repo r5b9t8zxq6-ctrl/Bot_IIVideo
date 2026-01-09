@@ -62,6 +62,18 @@ async def text_to_image(message: Message):
 
     try:
         output = await asyncio.to_thread(generate)
+        urls = extract_urls(output)
+
+        if not urls:
+            await message.answer("❌ Модель не вернула изображение")
+            return
+
+        for url in urls:
+            await message.answer_photo(url)
+
+    except Exception:
+        logging.exception("TEXT2IMG ERROR")
+        await message.answer("❌ Ошибка генерации изображения")
 
         # 🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
         images = []
@@ -105,22 +117,16 @@ async def image_edit(message: Message):
 
     try:
         output = await asyncio.to_thread(generate)
+        urls = extract_urls(output)
 
-        images = []
-
-        if isinstance(output, dict):
-            images = output.get("images", [])
-        elif isinstance(output, list):
-            images = output
-
-        if not images:
+        if not urls:
             await message.answer("❌ Модель не вернула изображение")
             return
 
-        for url in images:
+        for url in urls:
             await message.answer_photo(url)
 
-    except Exception as e:
+    except Exception:
         logging.exception("IMG2IMG ERROR")
         await message.answer("❌ Ошибка обработки изображения")
 
