@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, Update
 from aiogram.filters import CommandStart
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 from replicate.exceptions import ReplicateError
 
@@ -19,12 +20,16 @@ REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN or not REPLICATE_API_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN или REPLICATE_API_TOKEN не заданы")
+    raise RuntimeError("BOT_TOKEN или REPLICATE_API_TOKEN не заданы")
 
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = "https://bot-iivideo.onrender.com/webhook"
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
+
 dp = Dispatcher()
 app = FastAPI()
 
@@ -38,16 +43,16 @@ def enhance_prompt(text: str) -> str:
         "Natural lighting, 35mm, high detail, cinematic realism."
     )
 
-# ---------- REPLICATE RUNNER ----------
+# ---------- REPLICATE ----------
 def extract_urls(output):
     images = []
 
     if isinstance(output, list):
         for item in output:
-            if hasattr(item, "url"):
-                images.append(item.url)
-            elif isinstance(item, str):
+            if isinstance(item, str):
                 images.append(item)
+            elif hasattr(item, "url"):
+                images.append(item.url)
 
     elif isinstance(output, dict):
         images = output.get("images", [])
@@ -57,9 +62,15 @@ def extract_urls(output):
 
 async def run_replicate(generate_func):
     try:
-        output = await asyncio.to_thread(generate_func)
-        images = extract_urls(output)
-        return images
+        output = await asyncio.wait_for(
+            asyncio.to_thread(generate_func),
+            timeout=120
+        )
+        return extract_urls(output)
+
+    except asyncio.TimeoutError:
+        logging.error("Replicate timeout")
+        return None
 
     except ReplicateError as e:
         if "429" in str(e):
@@ -71,8 +82,7 @@ async def run_replicate(generate_func):
         logging.exception("Unknown replicate error")
         return None
 
-
-# ---------- START ----------
+# ---------- HANDLERS ----------
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
@@ -80,7 +90,6 @@ async def start(message: Message):
         "📸 Или отправь фото + текст — отредактирую"
     )
 
-# ---------- TEXT → IMAGE ----------
 @dp.message(lambda m: m.text and not m.photo)
 async def text_to_image(message: Message):
     await message.answer("🎨 Генерирую изображение...")
@@ -102,13 +111,12 @@ async def text_to_image(message: Message):
         return
 
     if not result:
-        await message.answer("❌ Ошибка генерации изображения")
+        await message.answer("❌ Не удалось сгенерировать изображение")
         return
 
     for url in result:
         await message.answer_photo(url)
 
-# ---------- IMAGE → IMAGE ----------
 @dp.message(lambda m: m.photo)
 async def image_to_image(message: Message):
     await message.answer("🧠 Обрабатываю изображение...")
@@ -136,7 +144,7 @@ async def image_to_image(message: Message):
         return
 
     if not result:
-        await message.answer("❌ Ошибка обработки изображения")
+        await message.answer("❌ Не удалось обработать изображение")
         return
 
     for url in result:
@@ -144,9 +152,8 @@ async def image_to_image(message: Message):
 
 # ---------- WEBHOOK ----------
 @app.post(WEBHOOK_PATH)
-async def webhook(request: Request):
-    update_data = await request.json()
-    update = Update.model_validate(update_data)
+async def telegram_webhook(request: Request):
+    update = Update.model_validate(await request.json())
     await dp.feed_update(bot, update)
     return {"ok": True}
 
@@ -160,7 +167,7 @@ async def health():
 async def on_startup():
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL)
-    logging.info("✅ Webhook установлен")
+    logging.info("Webhook установлен")
 
 @app.on_event("shutdown")
 async def on_shutdown():
