@@ -1,188 +1,208 @@
 import os
+import time
 import asyncio
 import logging
-from typing import Optional
-
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message
-from aiogram.exceptions import TelegramBadRequest
-from fastapi import FastAPI, Request, HTTPException
-from dotenv import load_dotenv
+import aiohttp
 import replicate
 
-# =======================
-# ENV
-# =======================
+from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
 
-load_dotenv()
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    Update,
+)
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import CommandStart
+from aiogram.exceptions import TelegramBadRequest
+
+# ================= ENV =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", 10000))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # ← ОБЯЗАТЕЛЬНО
 
-MODEL_SLUG = "kwaivgi/kling-v2.5-turbo-pro"
+if not all([BOT_TOKEN, REPLICATE_API_TOKEN, WEBHOOK_URL, WEBHOOK_SECRET]):
+    raise RuntimeError("❌ Missing ENV variables")
 
-MAX_RETRIES = 3
-POLL_INTERVAL = 5
-
-if not all([BOT_TOKEN, REPLICATE_API_TOKEN, WEBHOOK_SECRET, WEBHOOK_URL]):
-    raise RuntimeError("❌ Missing env variables")
-
-# =======================
-# LOGGING
-# =======================
+os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
 logging.basicConfig(level=logging.INFO)
 
-# =======================
-# BOT / FASTAPI
-# =======================
+# ================= BOT =================
 
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+
+dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-app = FastAPI()
-
-# =======================
-# REPLICATE
-# =======================
-
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
-KLING_VERSION: Optional[str] = None
 
-# =======================
-# QUEUE
-# =======================
+# ================= GLOBALS =================
 
 generation_queue: asyncio.Queue = asyncio.Queue()
+KLING_VERSION: str | None = None
 
-# =======================
-# GET LATEST VERSION (SDK — ПРАВИЛЬНО)
-# =======================
+# ================= FSM =================
+
+class FlowState(StatesGroup):
+    waiting_prompt = State()
+
+# ================= KEYBOARD =================
+
+main_kb = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 TEXT → VIDEO", callback_data="text_video")]
+    ]
+)
+
+# ================= HELPERS =================
+
+def enhance_prompt(text: str) -> str:
+    return (
+        "Ultra realistic cinematic scene. "
+        f"{text}. Natural lighting, 35mm, depth of field, dramatic motion."
+    )
+
+async def download_file(url: str) -> bytes:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            return await resp.read()
 
 def get_latest_kling_version() -> str:
-    model = replicate_client.models.get(MODEL_SLUG)
+    model = replicate_client.models.get("kwaivgi/kling-v2.5-turbo-pro")
     return model.latest_version.id
 
-# =======================
-# WORKER
-# =======================
-
-async def generation_worker():
-    logging.info("🚀 Generation worker started")
-
-    while True:
-        chat_id, prompt = await generation_queue.get()
-        try:
-            await generate_video(chat_id, prompt)
-        except Exception as e:
-            logging.exception(e)
-            await bot.send_message(
-                chat_id,
-                "❌ Ошибка генерации.\nМодель перегружена или временно недоступна."
-            )
-        generation_queue.task_done()
-
-# =======================
-# GENERATION
-# =======================
+# ================= GENERATION =================
 
 async def generate_video(chat_id: int, prompt: str):
-    msg = await bot.send_message(chat_id, "🎬 Генерация началась (0%)")
-    last_progress = -1
+    msg = await bot.send_message(chat_id, "⏳ Генерация… 0%")
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            prediction = replicate_client.predictions.create(
-                version=KLING_VERSION,
-                input={
-                    "prompt": prompt,
-                    "duration": 5,
-                    "fps": 24,
-                },
-            )
+    try:
+        prediction = replicate_client.predictions.create(
+            version=KLING_VERSION,
+            input={
+                "prompt": enhance_prompt(prompt),
+                "duration": 5,
+                "fps": 24,
+            },
+        )
 
-            progress = 0
+        last_progress = -1
+        start_time = time.time()
 
-            while prediction.status not in ("succeeded", "failed"):
-                await asyncio.sleep(POLL_INTERVAL)
-                prediction = replicate_client.predictions.get(prediction.id)
+        while True:
+            prediction.reload()
 
-                progress = min(progress + 10, 90)
-                if progress != last_progress:
-                    try:
-                        await msg.edit_text(f"⏳ Генерация… {progress}%")
-                        last_progress = progress
-                    except TelegramBadRequest:
-                        pass
+            if prediction.status == "failed":
+                raise RuntimeError("Generation failed")
 
             if prediction.status == "succeeded":
-                await msg.edit_text("✅ Готово! 100%")
-                await bot.send_message(chat_id, prediction.output[0])
-                return
+                break
 
-            raise RuntimeError("Prediction failed")
+            # timeout 5 минут
+            if time.time() - start_time > 300:
+                raise TimeoutError("Generation timeout")
 
-        except Exception as e:
-            logging.warning(f"Retry {attempt}/{MAX_RETRIES}: {e}")
-            if attempt == MAX_RETRIES:
-                raise
+            # фейковый, но стабильный прогресс
+            progress = min(95, int((time.time() - start_time) / 3 * 10))
+            if progress != last_progress:
+                try:
+                    await msg.edit_text(f"⏳ Генерация… {progress}%")
+                except TelegramBadRequest:
+                    pass
+                last_progress = progress
 
-# =======================
-# HANDLERS
-# =======================
+            await asyncio.sleep(3)
 
-@router.message(F.text == "/start")
+        output_url = prediction.output
+        video_bytes = await download_file(output_url)
+
+        await msg.delete()
+        await bot.send_video(
+            chat_id,
+            video=video_bytes,
+            caption="🎉 Видео готово!",
+            reply_markup=main_kb,
+        )
+
+    except Exception as e:
+        logging.exception(e)
+        await msg.edit_text(
+            "❌ Ошибка генерации.\nВозможно, модель перегружена."
+        )
+
+# ================= QUEUE WORKER =================
+
+async def generation_worker():
+    logging.info("✅ Generation worker started")
+    while True:
+        chat_id, prompt = await generation_queue.get()
+        await generate_video(chat_id, prompt)
+        generation_queue.task_done()
+
+# ================= HANDLERS =================
+
+@router.message(CommandStart())
 async def start(message: Message):
-    await message.answer("👋 Отправь текст — я сгенерирую видео через Kling")
+    await message.answer("Выбери режим 👇", reply_markup=main_kb)
 
-@router.message(F.text & ~F.text.startswith("/"))
-async def handle_prompt(message: Message):
+@router.callback_query(F.data == "text_video")
+async def text_video(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(FlowState.waiting_prompt)
+    await cb.message.answer("✍️ Опиши сцену")
+    await cb.answer()
+
+@router.message(FlowState.waiting_prompt)
+async def receive_prompt(message: Message, state: FSMContext):
+    await state.clear()
     await generation_queue.put((message.chat.id, message.text))
     await message.answer("📥 Запрос добавлен в очередь")
 
-# =======================
-# WEBHOOK
-# =======================
+# ================= FASTAPI + WEBHOOK =================
 
-@app.post("/")
-async def telegram_webhook(request: Request):
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403)
-
-    await dp.feed_raw_update(bot, await request.json())
-    return {"ok": True}
-
-# =======================
-# LIFESPAN (НЕ deprecated)
-# =======================
-
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global KLING_VERSION
 
-    try:
-        KLING_VERSION = get_latest_kling_version()
-        logging.info(f"✅ Kling version: {KLING_VERSION}")
-    except Exception as e:
-        logging.exception("❌ Failed to fetch Kling version")
-        raise RuntimeError("Kling model unavailable")
+    KLING_VERSION = get_latest_kling_version()
+    logging.info(f"✅ Kling version loaded: {KLING_VERSION}")
 
     asyncio.create_task(generation_worker())
 
     await bot.set_webhook(
         url=WEBHOOK_URL,
         secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
     )
+    logging.info("✅ Webhook set")
 
-# =======================
-# LOCAL
-# =======================
+    yield
+    await bot.session.close()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/")
+async def telegram_webhook(request: Request):
+    update = Update.model_validate(await request.json())
+    await dp.feed_update(bot, update)
+    return {"ok": True}
+
+# ================= LOCAL =================
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run("bot:app", host="0.0.0.0", port=10000)
