@@ -1,6 +1,8 @@
-aiogram==3.*
-fastapi
-uvicorn
-python-dotenv
-replicate
-aiohttp
+aiogram==3.24.0
+fastapi==0.128.0
+uvicorn==0.40.0
+replicate==1.0.7
+openai>=1.0.0
+python-dotenv==1.2.1
+httpx==0.28.1
+aiofiles==25.1.0
