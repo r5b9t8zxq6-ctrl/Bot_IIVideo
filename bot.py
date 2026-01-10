@@ -1,10 +1,13 @@
 import os
 import asyncio
 import logging
-from typing import Any
+from typing import Any, AsyncIterator
 
 import replicate
+import uvicorn
 from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, Update
 from aiogram.filters import CommandStart
@@ -17,9 +20,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
 
-replicate.Client(api_token=REPLICATE_API_TOKEN)
-
 logging.basicConfig(level=logging.INFO)
+
+replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
 # ================== BOT ==================
 
@@ -27,6 +30,7 @@ bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
+
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -34,8 +38,9 @@ dp.include_router(router)
 # ================== QUEUE ==================
 
 generation_queue: asyncio.Queue = asyncio.Queue()
-GENERATION_TIMEOUT = 120        # секунд
-POLL_INTERVAL = 3               # секунд
+
+GENERATION_TIMEOUT = 120
+POLL_INTERVAL = 3
 MAX_POLLS = GENERATION_TIMEOUT // POLL_INTERVAL
 
 
@@ -64,14 +69,10 @@ def extract_video_url(output: Any) -> str:
 
 
 async def wait_for_prediction_with_progress(prediction, progress_message: Message):
-    """
-    Polling Replicate + обновление прогресса
-    """
     for attempt in range(1, MAX_POLLS + 1):
         prediction.reload()
 
-        progress = int((attempt / MAX_POLLS) * 100)
-        progress = min(progress, 99)
+        progress = min(int((attempt / MAX_POLLS) * 100), 99)
 
         try:
             await progress_message.edit_text(
@@ -99,6 +100,7 @@ async def wait_for_prediction_with_progress(prediction, progress_message: Messag
 # ================== WORKER ==================
 
 async def generation_worker():
+    logging.info("Generation worker started")
     while True:
         message, prompt = await generation_queue.get()
         try:
@@ -107,7 +109,7 @@ async def generation_worker():
                 "⏳ Прогресс: <b>0%</b>"
             )
 
-            prediction = replicate.predictions.create(
+            prediction = replicate_client.predictions.create(
                 version="kling-ai/kling-video:latest",
                 input={"prompt": prompt},
             )
@@ -117,7 +119,6 @@ async def generation_worker():
             )
 
             video_url = extract_video_url(prediction.output)
-
             await message.answer_video(video_url)
 
         except TimeoutError:
@@ -136,7 +137,7 @@ async def start(message: Message):
     await message.answer(
         "Привет 👋\n"
         "Отправь текст — я сгенерирую видео.\n"
-        "⏱ Прогресс будет отображаться в процентах.\n"
+        "⏱ Прогресс показывается в процентах.\n"
         "⚠️ Генерации идут по очереди."
     )
 
@@ -147,15 +148,15 @@ async def generate_video(message: Message):
     await message.answer("📥 Запрос добавлен в очередь.")
 
 
-# ================== FASTAPI ==================
+# ================== FASTAPI + LIFESPAN ==================
 
-app = FastAPI()
-
-
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     asyncio.create_task(generation_worker())
-    logging.info("Generation worker started")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/")
@@ -169,3 +170,14 @@ async def telegram_webhook(request: Request):
 @app.get("/ping")
 async def ping():
     return {"status": "ok"}
+
+
+# ================== RUN ==================
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "bot:app",
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info",
+    )
