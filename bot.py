@@ -112,7 +112,6 @@ async def generate_video(chat_id: int, prompt: str):
             if prediction.status == "failed":
                 raise RuntimeError("Generation failed")
 
-            # ✅ КЛЮЧЕВО: ждём не только succeeded, но и output
             if prediction.status == "succeeded" and prediction.output:
                 break
 
@@ -130,7 +129,10 @@ async def generate_video(chat_id: int, prompt: str):
         output = prediction.output
         video_url = None
 
-        if isinstance(output, list):
+        if isinstance(output, str):
+            video_url = output
+
+        elif isinstance(output, list):
             for item in output:
                 if isinstance(item, dict):
                     video_url = item.get("video") or item.get("url")
