@@ -18,9 +18,13 @@ from aiogram.enums import ParseMode
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+KLING_VERSION = os.getenv("KLING_VERSION")  # ОБЯЗАТЕЛЬНО
 PORT = int(os.getenv("PORT", 10000))
 
 logging.basicConfig(level=logging.INFO)
+
+if not KLING_VERSION:
+    raise RuntimeError("KLING_VERSION env variable is required")
 
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
@@ -39,10 +43,9 @@ dp.include_router(router)
 
 generation_queue: asyncio.Queue = asyncio.Queue()
 
-GENERATION_TIMEOUT = 120
+GENERATION_TIMEOUT = 180
 POLL_INTERVAL = 3
 MAX_POLLS = GENERATION_TIMEOUT // POLL_INTERVAL
-
 
 # ================== HELPERS ==================
 
@@ -61,31 +64,31 @@ def extract_video_url(output: Any) -> str:
                 pass
 
     if isinstance(output, dict):
-        for key in ("video", "url", "output", "file"):
-            if key in output:
-                return extract_video_url(output[key])
+        for value in output.values():
+            try:
+                return extract_video_url(value)
+            except Exception:
+                pass
 
-    raise RuntimeError(f"Unknown Kling output format: {output}")
+    raise RuntimeError(f"Unknown output format: {output}")
 
-
-async def wait_for_prediction_with_progress(prediction, progress_message: Message):
-    for attempt in range(1, MAX_POLLS + 1):
+async def wait_with_progress(prediction, progress_message: Message):
+    for step in range(1, MAX_POLLS + 1):
         prediction.reload()
 
-        progress = min(int((attempt / MAX_POLLS) * 100), 99)
+        percent = min(int(step / MAX_POLLS * 100), 99)
 
         try:
             await progress_message.edit_text(
-                f"🎬 Генерация видео...\n"
-                f"⏳ Прогресс: <b>{progress}%</b>"
+                f"🎬 Генерация видео\n"
+                f"⏳ Прогресс: <b>{percent}%</b>"
             )
         except Exception:
             pass
 
         if prediction.status == "succeeded":
             await progress_message.edit_text(
-                "🎬 Генерация завершена!\n"
-                "⏳ Прогресс: <b>100%</b>"
+                "🎬 Готово!\n⏳ Прогресс: <b>100%</b>"
             )
             return prediction
 
@@ -96,81 +99,74 @@ async def wait_for_prediction_with_progress(prediction, progress_message: Messag
 
     raise TimeoutError("Generation timeout")
 
-
 # ================== WORKER ==================
 
 async def generation_worker():
     logging.info("Generation worker started")
+
     while True:
         message, prompt = await generation_queue.get()
+
         try:
             progress_message = await message.answer(
-                "🎬 Генерация видео...\n"
-                "⏳ Прогресс: <b>0%</b>"
+                "🎬 Генерация видео\n⏳ Прогресс: <b>0%</b>"
             )
 
             prediction = replicate_client.predictions.create(
-                version="kling-ai/kling-video:latest",
+                version=KLING_VERSION,
                 input={"prompt": prompt},
             )
 
-            prediction = await wait_for_prediction_with_progress(
-                prediction, progress_message
-            )
+            prediction = await wait_with_progress(prediction, progress_message)
 
             video_url = extract_video_url(prediction.output)
             await message.answer_video(video_url)
 
-        except TimeoutError:
-            await message.answer("⏳ Время ожидания вышло. Попробуй ещё раз.")
         except Exception as e:
             logging.exception(e)
-            await message.answer("❌ Ошибка генерации.")
+            await message.answer(
+                "❌ Ошибка генерации.\n"
+                "Возможно, модель недоступна или перегружена."
+            )
+
         finally:
             generation_queue.task_done()
-
 
 # ================== HANDLERS ==================
 
 @router.message(CommandStart())
 async def start(message: Message):
     await message.answer(
-        "Привет 👋\n"
+        "👋 Привет!\n\n"
         "Отправь текст — я сгенерирую видео.\n"
-        "⏱ Прогресс показывается в процентах.\n"
-        "⚠️ Генерации идут по очереди."
+        "🎬 Генерации идут по очереди\n"
+        "⏳ Прогресс показывается в процентах"
     )
 
-
 @router.message(F.text)
-async def generate_video(message: Message):
+async def generate(message: Message):
     await generation_queue.put((message, message.text))
-    await message.answer("📥 Запрос добавлен в очередь.")
+    await message.answer("📥 Запрос добавлен в очередь")
 
-
-# ================== FASTAPI + LIFESPAN ==================
+# ================== FASTAPI ==================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     asyncio.create_task(generation_worker())
     yield
 
-
 app = FastAPI(lifespan=lifespan)
 
-
 @app.post("/")
-async def telegram_webhook(request: Request):
+async def webhook(request: Request):
     data = await request.json()
     update = Update.model_validate(data)
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-
 @app.get("/ping")
 async def ping():
     return {"status": "ok"}
-
 
 # ================== RUN ==================
 
