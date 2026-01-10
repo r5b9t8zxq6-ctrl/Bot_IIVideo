@@ -17,7 +17,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ================== CONFIG ==================
+# ================== ENV ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
@@ -26,12 +26,13 @@ os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
 logging.basicConfig(level=logging.INFO)
 
-# ================== INIT ==================
+# ================== BOT ==================
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
+# ================== FASTAPI ==================
 app = FastAPI()
 
 # ================== STATES ==================
@@ -87,7 +88,7 @@ async def text_to_image_to_video(message: Message, state: FSMContext):
     image_url = image.url
     await message.answer_photo(image_url, caption="🖼 Кадр готов")
 
-    await asyncio.sleep(8)
+    await asyncio.sleep(8)  # анти-429
 
     await message.answer("🎬 Генерирую видео...")
 
@@ -169,7 +170,7 @@ async def webhook(request: Request):
     return {"ok": True}
 
 @app.on_event("startup")
-async def on_startup():
+async def startup():
     await bot.set_webhook(
         WEBHOOK_URL,
         allowed_updates=["message", "callback_query"]
@@ -177,5 +178,11 @@ async def on_startup():
     logging.info("✅ Webhook установлен")
 
 @app.on_event("shutdown")
-async def on_shutdown():
+async def shutdown():
     await bot.delete_webhook()
+    await bot.session.close()
+
+# ================== RUN (ОБЯЗАТЕЛЬНО) ==================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)
