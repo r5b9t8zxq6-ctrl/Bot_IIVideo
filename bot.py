@@ -1,6 +1,5 @@
 import os
 import asyncio
-import uuid
 import tempfile
 from typing import Dict, Any
 
@@ -22,6 +21,8 @@ from aiogram.client.default import DefaultBotProperties
 
 from fastapi import FastAPI, Request, HTTPException
 from openai import AsyncOpenAI
+import uvicorn
+from contextlib import asynccontextmanager
 
 # =========================
 # ENV
@@ -32,20 +33,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-BASE_URL = os.getenv("BASE_URL")
+BASE_URL = os.getenv("BASE_URL")  # https://your-app.onrender.com
 
 replicate.Client(api_token=REPLICATE_API_TOKEN)
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
-# BOT (FIXED)
+# BOT
 # =========================
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
-app = FastAPI()
 
 # =========================
 # MODELS
@@ -73,7 +73,7 @@ def main_keyboard():
     ])
 
 # =========================
-# START
+# HANDLERS
 # =========================
 @dp.message(CommandStart())
 async def start(msg: Message):
@@ -82,17 +82,11 @@ async def start(msg: Message):
         reply_markup=main_keyboard()
     )
 
-# =========================
-# CALLBACKS
-# =========================
 @dp.callback_query(F.data.in_({"video", "image", "music", "gpt"}))
-async def mode_select(cb: CallbackQuery):
+async def select_mode(cb: CallbackQuery):
     states[cb.from_user.id] = {"mode": cb.data}
     await cb.message.answer("✍️ Введите запрос:")
 
-# =========================
-# TEXT INPUT
-# =========================
 @dp.message(F.text)
 async def handle_text(msg: Message):
     state = states.pop(msg.from_user.id, None)
@@ -100,7 +94,7 @@ async def handle_text(msg: Message):
         return
 
     await queue.put((state["mode"], msg.chat.id, msg.text))
-    await msg.answer("⏳ Запрос принят, обрабатываю…")
+    await msg.answer("⏳ Запрос добавлен в очередь...")
 
 # =========================
 # WORKER
@@ -137,7 +131,7 @@ async def worker():
         queue.task_done()
 
 # =========================
-# SEND FILE (FSInputFile)
+# SEND FILE
 # =========================
 async def send_file(chat_id: int, output, ext: str):
     async with aiohttp.ClientSession() as session:
@@ -158,20 +152,36 @@ async def send_file(chat_id: int, output, ext: str):
     os.remove(path)
 
 # =========================
-# WEBHOOK
+# FASTAPI (LIFESPAN)
 # =========================
-@app.post("/webhook")
-async def webhook(req: Request):
-    if req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        raise HTTPException(403)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await bot.set_webhook(
+        f"{BASE_URL}/webhook",
+        secret_token=WEBHOOK_SECRET
+    )
+    asyncio.create_task(worker())
+    yield
+    await bot.session.close()
 
-    await dp.feed_raw_update(bot, await req.body())
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/webhook")
+async def telegram_webhook(req: Request):
+    if req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403)
+
+    update = await req.json()
+    await dp.feed_raw_update(bot, update)
     return {"ok": True}
 
 # =========================
-# STARTUP
+# RUN SERVER
 # =========================
-@app.on_event("startup")
-async def startup():
-    await bot.set_webhook(f"{BASE_URL}/webhook", secret_token=WEBHOOK_SECRET)
-    asyncio.create_task(worker())
+if __name__ == "__main__":
+    uvicorn.run(
+        "bot:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        log_level="info"
+    )
