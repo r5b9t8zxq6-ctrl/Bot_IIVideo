@@ -1,303 +1,155 @@
 import os
 import asyncio
 import logging
-from contextlib import asynccontextmanager
-from collections import defaultdict
+from typing import Any
 
-import aiohttp
 import replicate
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Update,
-    BufferedInputFile,
-)
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
+from aiogram.types import Message, Update
 from aiogram.filters import CommandStart
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
-# ================= ENV =================
+# ================== CONFIG ==================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.getenv("PORT", 10000))
 
-if not BOT_TOKEN or not REPLICATE_API_TOKEN or not WEBHOOK_URL:
-    raise RuntimeError("ENV variables missing")
-
-os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
+replicate.Client(api_token=REPLICATE_API_TOKEN)
 
 logging.basicConfig(level=logging.INFO)
 
-# ================= BOT =================
+# ================== BOT ==================
+
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
-
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
+# ================== QUEUE ==================
 
-# ================= FSM =================
-class FlowState(StatesGroup):
-    waiting_prompt = State()
-    waiting_image_prompt = State()
-
-# ================= QUEUE =================
-user_locks = defaultdict(asyncio.Lock)
-
-# ================= KEYBOARD =================
-main_kb = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="🎨 TEXT → IMAGE → VIDEO",
-                callback_data="text_image_video",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="🖼 TEXT + IMAGE → VIDEO",
-                callback_data="text_plus_image_video",
-            )
-        ],
-    ]
-)
-
-# ================= HELPERS =================
-def enhance_prompt(text: str) -> str:
-    return (
-        "Ultra realistic cinematic scene. "
-        f"{text}. Natural lighting, 35mm, depth of field, dramatic motion."
-    )
+generation_queue: asyncio.Queue = asyncio.Queue()
+GENERATION_TIMEOUT = 120        # максимум ожидания генерации
+POLL_INTERVAL = 3               # секунд между запросами
+MAX_POLLS = GENERATION_TIMEOUT // POLL_INTERVAL
 
 
-async def wait_prediction(
-    prediction_id: str,
-    timeout: int = 300,
-    interval: int = 3,
-):
-    elapsed = 0
-    while elapsed < timeout:
-        pred = replicate_client.predictions.get(prediction_id)
+# ================== HELPERS ==================
 
-        if pred.status == "succeeded":
-            return pred
+def extract_video_url(output: Any) -> str:
+    """
+    Универсальный парсер Kling / Replicate output
+    """
+    if not output:
+        raise RuntimeError("Empty output")
 
-        if pred.status == "failed":
-            raise RuntimeError(pred.error)
+    # строка
+    if isinstance(output, str) and output.startswith("http"):
+        return output
 
-        await asyncio.sleep(interval)
-        elapsed += interval
+    # список
+    if isinstance(output, list):
+        for item in output:
+            try:
+                return extract_video_url(item)
+            except Exception:
+                pass
+
+    # dict
+    if isinstance(output, dict):
+        for key in ("video", "url", "output", "file"):
+            if key in output:
+                return extract_video_url(output[key])
+
+    raise RuntimeError(f"Unknown Kling output format: {output}")
+
+
+async def wait_for_prediction(prediction):
+    """
+    Polling Replicate с тайм-аутом
+    """
+    for _ in range(MAX_POLLS):
+        prediction.reload()
+        if prediction.status == "succeeded":
+            return prediction
+        if prediction.status == "failed":
+            raise RuntimeError("Generation failed")
+        await asyncio.sleep(POLL_INTERVAL)
 
     raise TimeoutError("Generation timeout")
 
 
-async def download_video_safe(url: str, max_mb: int = 45):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            size = int(resp.headers.get("Content-Length", 0))
-            if size and size > max_mb * 1024 * 1024:
-                return None
+# ================== WORKER ==================
 
-            data = await resp.read()
-            return BufferedInputFile(data, filename="video.mp4")
+async def generation_worker():
+    while True:
+        message, prompt = await generation_queue.get()
+        try:
+            await message.answer("🎬 Генерирую видео, подожди...")
+
+            prediction = replicate.predictions.create(
+                version="kling-ai/kling-video:latest",
+                input={
+                    "prompt": prompt,
+                },
+            )
+
+            prediction = await wait_for_prediction(prediction)
+
+            video_url = extract_video_url(prediction.output)
+
+            await message.answer_video(video_url)
+
+        except TimeoutError:
+            await message.answer("⏳ Время ожидания вышло. Попробуй ещё раз.")
+        except Exception as e:
+            logging.exception(e)
+            await message.answer("❌ Ошибка генерации.")
+        finally:
+            generation_queue.task_done()
 
 
-def extract_video_url(output):
-    if isinstance(output, list) and output:
-        return output[0]
-    if isinstance(output, dict):
-        return output.get("video")
-    raise RuntimeError("Unknown Kling output format")
+# ================== HANDLERS ==================
 
-# ================= HANDLERS =================
 @router.message(CommandStart())
 async def start(message: Message):
     await message.answer(
-        "Выбери режим генерации 👇",
-        reply_markup=main_kb,
+        "Привет 👋\n"
+        "Отправь текст — я сгенерирую видео.\n"
+        "⚠️ Генерации идут по очереди."
     )
 
 
-# ---------- BUTTONS ----------
-@router.callback_query(F.data == "text_image_video")
-async def text_image_video_btn(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await state.set_state(FlowState.waiting_prompt)
-    await cb.message.answer("✍️ Напиши описание сцены")
-    await cb.answer()
+@router.message(F.text)
+async def generate_video(message: Message):
+    await generation_queue.put((message, message.text))
+    await message.answer("📥 Запрос добавлен в очередь.")
 
 
-@router.callback_query(F.data == "text_plus_image_video")
-async def text_plus_image_video_btn(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await state.set_state(FlowState.waiting_image_prompt)
-    await cb.message.answer("🖼 Отправь изображение с описанием")
-    await cb.answer()
+# ================== FASTAPI ==================
+
+app = FastAPI()
 
 
-# ---------- TEXT → IMAGE → VIDEO ----------
-@router.message(FlowState.waiting_prompt)
-async def text_to_image_to_video(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    prompt = message.text
-    await state.clear()
-
-    async with user_locks[user_id]:
-        try:
-            await message.answer("🎨 Генерирую изображение...")
-
-            image_pred = replicate_client.predictions.create(
-                model="prunaai/flux-fast",
-                input={"prompt": enhance_prompt(prompt)},
-            )
-
-            image_result = await wait_prediction(image_pred.id)
-            image_url = image_result.output[0]
-
-            await message.answer_photo(image_url)
-            await message.answer("🎬 Генерирую видео...")
-
-            video_pred = replicate_client.predictions.create(
-                model="kwaivgi/kling-v2.5-turbo-pro",
-                input={
-                    "start_image": image_url,
-                    "prompt": prompt,
-                    "duration": 5,
-                    "fps": 24,
-                },
-            )
-
-            video_result = await wait_prediction(video_pred.id)
-            video_url = extract_video_url(video_result.output)
-
-            video_file = await download_video_safe(video_url)
-
-            if not video_file:
-                await message.answer(
-                    "⚠️ Видео получилось слишком большим. "
-                    "Попробуй уменьшить длительность.",
-                    reply_markup=main_kb,
-                )
-                return
-
-            await message.answer_video(
-                video=video_file,
-                caption="🎉 Видео готово!",
-                reply_markup=main_kb,
-            )
-
-        except TimeoutError:
-            await message.answer(
-                "⏳ Генерация заняла слишком много времени.",
-                reply_markup=main_kb,
-            )
-
-        except Exception as e:
-            logging.exception(e)
-            await message.answer(
-                "❌ Ошибка генерации.",
-                reply_markup=main_kb,
-            )
-
-
-# ---------- TEXT + IMAGE → VIDEO ----------
-@router.message(FlowState.waiting_image_prompt, F.photo)
-async def text_plus_image_to_video(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    prompt = message.caption or "Cinematic motion"
-    await state.clear()
-
-    async with user_locks[user_id]:
-        try:
-            photo = message.photo[-1]
-            file = await bot.get_file(photo.file_id)
-            image_url = (
-                f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-            )
-
-            await message.answer("🎬 Генерирую видео...")
-
-            video_pred = replicate_client.predictions.create(
-                model="kwaivgi/kling-v2.5-turbo-pro",
-                input={
-                    "start_image": image_url,
-                    "prompt": enhance_prompt(prompt),
-                    "duration": 5,
-                    "fps": 24,
-                },
-            )
-
-            video_result = await wait_prediction(video_pred.id)
-            video_url = extract_video_url(video_result.output)
-
-            video_file = await download_video_safe(video_url)
-
-            if not video_file:
-                await message.answer(
-                    "⚠️ Видео получилось слишком большим.",
-                    reply_markup=main_kb,
-                )
-                return
-
-            await message.answer_video(
-                video=video_file,
-                caption="🎉 Видео готово!",
-                reply_markup=main_kb,
-            )
-
-        except TimeoutError:
-            await message.answer(
-                "⏳ Видео генерировалось слишком долго.",
-                reply_markup=main_kb,
-            )
-
-        except Exception as e:
-            logging.exception(e)
-            await message.answer(
-                "❌ Ошибка генерации.",
-                reply_markup=main_kb,
-            )
-
-
-# ================= FASTAPI + WEBHOOK =================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await bot.set_webhook(
-        url=WEBHOOK_URL,
-        drop_pending_updates=True,
-    )
-    logging.info("✅ Webhook установлен")
-    yield
-    await bot.session.close()
-
-
-app = FastAPI(lifespan=lifespan)
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(generation_worker())
+    logging.info("Worker started")
 
 
 @app.post("/")
 async def telegram_webhook(request: Request):
-    update = Update.model_validate(await request.json())
+    data = await request.json()
+    update = Update.model_validate(data)
     await dp.feed_update(bot, update)
     return {"ok": True}
 
 
-# ================= LOCAL =================
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "bot:app",
-        host="0.0.0.0",
-        port=10000,
-    )
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
