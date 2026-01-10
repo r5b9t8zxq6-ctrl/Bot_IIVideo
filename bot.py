@@ -1,179 +1,149 @@
 import os
 import asyncio
 import logging
-from typing import Any, AsyncIterator
-
-import replicate
-import uvicorn
-from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
 
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, Update
-from aiogram.filters import CommandStart
-from aiogram.client.default import DefaultBotProperties
+from fastapi import FastAPI, Request, Header, HTTPException
+from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
+from aiogram.types import Message
+from dotenv import load_dotenv
+import replicate
 
-# ================== CONFIG ==================
+# =======================
+# ENV
+# =======================
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-KLING_VERSION = os.getenv("KLING_VERSION")  # ОБЯЗАТЕЛЬНО
-PORT = int(os.getenv("PORT", 10000))
 
+if not all([BOT_TOKEN, WEBHOOK_URL, WEBHOOK_SECRET, REPLICATE_API_TOKEN]):
+    raise RuntimeError("❌ Не заданы переменные окружения")
+
+# =======================
+# LOGGING
+# =======================
 logging.basicConfig(level=logging.INFO)
 
-if not KLING_VERSION:
-    raise RuntimeError("KLING_VERSION env variable is required")
+# =======================
+# BOT
+# =======================
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
 
+# =======================
+# REPLICATE
+# =======================
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# ================== BOT ==================
+KLING_VERSION = "5c7d5dc6dd8bf75c1acaa8565735e7986bc5b66206b55cca93cb72c9bf15ccaa"
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
-
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
-
-# ================== QUEUE ==================
-
+# =======================
+# QUEUE
+# =======================
 generation_queue: asyncio.Queue = asyncio.Queue()
+MAX_RETRIES = 3
+TIMEOUT = 600  # 10 минут
 
-GENERATION_TIMEOUT = 180
-POLL_INTERVAL = 3
-MAX_POLLS = GENERATION_TIMEOUT // POLL_INTERVAL
-
-# ================== HELPERS ==================
-
-def extract_video_url(output: Any) -> str:
-    if not output:
-        raise RuntimeError("Empty output")
-
-    if isinstance(output, str) and output.startswith("http"):
-        return output
-
-    if isinstance(output, list):
-        for item in output:
-            try:
-                return extract_video_url(item)
-            except Exception:
-                pass
-
-    if isinstance(output, dict):
-        for value in output.values():
-            try:
-                return extract_video_url(value)
-            except Exception:
-                pass
-
-    raise RuntimeError(f"Unknown output format: {output}")
-
-async def wait_with_progress(prediction, progress_message: Message):
-    for step in range(1, MAX_POLLS + 1):
-        prediction.reload()
-
-        percent = min(int(step / MAX_POLLS * 100), 99)
-
-        try:
-            await progress_message.edit_text(
-                f"🎬 Генерация видео\n"
-                f"⏳ Прогресс: <b>{percent}%</b>"
-            )
-        except Exception:
-            pass
-
-        if prediction.status == "succeeded":
-            await progress_message.edit_text(
-                "🎬 Готово!\n⏳ Прогресс: <b>100%</b>"
-            )
-            return prediction
-
-        if prediction.status == "failed":
-            raise RuntimeError("Generation failed")
-
-        await asyncio.sleep(POLL_INTERVAL)
-
-    raise TimeoutError("Generation timeout")
-
-# ================== WORKER ==================
-
+# =======================
+# GENERATION WORKER
+# =======================
 async def generation_worker():
-    logging.info("Generation worker started")
+    logging.info("🚀 Generation worker started")
 
     while True:
-        message, prompt = await generation_queue.get()
+        task = await generation_queue.get()
+        chat_id, prompt = task
 
         try:
-            progress_message = await message.answer(
-                "🎬 Генерация видео\n⏳ Прогресс: <b>0%</b>"
-            )
+            await bot.send_message(chat_id, "🎬 Генерация началась...\nПрогресс: 0%")
 
-            prediction = replicate_client.predictions.create(
-                version=KLING_VERSION,
-                input={"prompt": prompt},
-            )
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    prediction = replicate_client.predictions.create(
+                        version=KLING_VERSION,
+                        input={
+                            "prompt": prompt
+                        }
+                    )
 
-            prediction = await wait_with_progress(prediction, progress_message)
+                    # Ожидание с прогрессом
+                    for i in range(TIMEOUT):
+                        prediction.reload()
 
-            video_url = extract_video_url(prediction.output)
-            await message.answer_video(video_url)
+                        if prediction.status == "succeeded":
+                            video_url = prediction.output
+                            await bot.send_message(
+                                chat_id,
+                                f"✅ Готово!\n\n{video_url}"
+                            )
+                            break
 
-        except Exception as e:
-            logging.exception(e)
-            await message.answer(
-                "❌ Ошибка генерации.\n"
-                "Возможно, модель недоступна или перегружена."
-            )
+                        if prediction.status == "failed":
+                            raise RuntimeError("Generation failed")
+
+                        progress = min(int((i / TIMEOUT) * 100), 99)
+                        await bot.send_message(
+                            chat_id,
+                            f"⏳ Генерация...\nПрогресс: {progress}%",
+                        )
+
+                        await asyncio.sleep(1)
+                    else:
+                        raise TimeoutError("Timeout")
+
+                    break
+
+                except Exception as e:
+                    logging.error(f"⚠️ Attempt {attempt} failed: {e}")
+
+                    if attempt == MAX_RETRIES:
+                        await bot.send_message(
+                            chat_id,
+                            "❌ Ошибка генерации.\nВозможно, модель недоступна или перегружена."
+                        )
 
         finally:
             generation_queue.task_done()
 
-# ================== HANDLERS ==================
-
-@router.message(CommandStart())
-async def start(message: Message):
-    await message.answer(
-        "👋 Привет!\n\n"
-        "Отправь текст — я сгенерирую видео.\n"
-        "🎬 Генерации идут по очереди\n"
-        "⏳ Прогресс показывается в процентах"
-    )
-
-@router.message(F.text)
-async def generate(message: Message):
-    await generation_queue.put((message, message.text))
+# =======================
+# HANDLERS
+# =======================
+@dp.message()
+async def handle_message(message: Message):
+    await generation_queue.put((message.chat.id, message.text))
     await message.answer("📥 Запрос добавлен в очередь")
 
-# ================== FASTAPI ==================
-
+# =======================
+# FASTAPI
+# =======================
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI):
+    await bot.set_webhook(
+        url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET
+    )
     asyncio.create_task(generation_worker())
     yield
+    await bot.delete_webhook()
 
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/")
-async def webhook(request: Request):
-    data = await request.json()
-    update = Update.model_validate(data)
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str = Header(None)
+):
+    if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    update = types.Update.model_validate(await request.json())
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-@app.get("/ping")
-async def ping():
+@app.get("/")
+async def health():
     return {"status": "ok"}
-
-# ================== RUN ==================
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "bot:app",
-        host="0.0.0.0",
-        port=PORT,
-        log_level="info",
-    )
