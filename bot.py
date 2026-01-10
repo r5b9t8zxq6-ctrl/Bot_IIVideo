@@ -6,6 +6,7 @@ from typing import Any, Dict, Literal
 
 import aiohttp
 import replicate
+from replicate.helpers import FileOutput
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
@@ -128,7 +129,7 @@ async def select_mode(cb: CallbackQuery):
 async def handle_text(msg: Message):
     mode = user_modes.get(msg.from_user.id)
     if not mode:
-        await msg.answer("⚠️ Сначала выбери режим с помощью кнопок ниже.")
+        await msg.answer("⚠️ Сначала выбери режим кнопками ниже.")
         return
 
     try:
@@ -138,7 +139,7 @@ async def handle_text(msg: Message):
         await msg.answer("🚫 Очередь переполнена. Попробуйте позже.")
 
 # =========================
-# WORKER
+# REPLICATE
 # =========================
 async def run_replicate(model: str, payload: Dict[str, Any]) -> Any:
     loop = asyncio.get_running_loop()
@@ -147,89 +148,44 @@ async def run_replicate(model: str, payload: Dict[str, Any]) -> Any:
         lambda: replicate_client.run(model, input=payload),
     )
 
-async def worker(worker_id: int):
-    logger.info("Worker %s started", worker_id)
-
-    timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            task: Task = await queue.get()
-            try:
-                logger.info("Processing %s for chat %s", task.mode, task.chat_id)
-
-                if task.mode == "gpt":
-                    res = await asyncio.wait_for(
-                        openai_client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=[{"role": "user", "content": task.prompt}],
-                        ),
-                        timeout=30,
-                    )
-                    await bot.send_message(task.chat_id, res.choices[0].message.content)
-                    continue
-
-                if task.mode == "video":
-                    output = await run_replicate(KLING_MODEL, {"prompt": task.prompt})
-                    ext = "mp4"
-                elif task.mode == "image":
-                    output = await run_replicate(IMAGE_MODEL, {"prompt": task.prompt})
-                    ext = "jpg"
-                else:
-                    output = await run_replicate(
-                        MUSIC_MODEL,
-                        {"prompt": task.prompt, "output_format": "mp3"},
-                    )
-                    ext = "mp3"
-
-                url = extract_url(output)
-                await download_and_send(task.chat_id, url, ext, session)
-
-            except asyncio.TimeoutError:
-                await bot.send_message(task.chat_id, "⏱ Таймаут запроса.")
-            except Exception:
-                logger.exception("Task failed. Raw output: %r", output)
-                await bot.send_message(task.chat_id, "❌ Ошибка обработки запроса.")
-            finally:
-                queue.task_done()
-
 # =========================
-# HELPERS
+# OUTPUT HANDLER (FIX)
 # =========================
-def extract_url(output: Any) -> str:
-    if not output:
-        raise ValueError("Empty model output")
+async def send_replicate_output(
+    chat_id: int,
+    output: Any,
+    ext: str,
+):
+    data: bytes | None = None
 
-    if isinstance(output, str):
-        return output
+    if isinstance(output, FileOutput):
+        data = output.read()
 
-    if isinstance(output, list):
+    elif isinstance(output, str):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(output) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Download failed: {resp.status}")
+                data = await resp.read()
+
+    elif isinstance(output, list):
         for item in output:
             try:
-                return extract_url(item)
-            except ValueError:
+                return await send_replicate_output(chat_id, item, ext)
+            except Exception:
                 pass
 
-    if isinstance(output, dict):
+    elif isinstance(output, dict):
         for value in output.values():
             try:
-                return extract_url(value)
-            except ValueError:
+                return await send_replicate_output(chat_id, value, ext)
+            except Exception:
                 pass
 
-    raise ValueError(f"Unsupported model output format: {type(output)}")
+    if not data:
+        raise ValueError(f"Unsupported output format: {type(output)}")
 
-async def download_and_send(
-    chat_id: int,
-    url: str,
-    ext: str,
-    session: aiohttp.ClientSession,
-):
-    async with session.get(url) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"Download failed: {resp.status}")
-        data = await resp.read()
-
-    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as f:
         f.write(data)
         path = f.name
 
@@ -243,6 +199,51 @@ async def download_and_send(
             await bot.send_audio(chat_id, file)
     finally:
         os.remove(path)
+
+# =========================
+# WORKER
+# =========================
+async def worker(worker_id: int):
+    logger.info("Worker %s started", worker_id)
+
+    while True:
+        task: Task = await queue.get()
+        try:
+            logger.info("Processing %s for chat %s", task.mode, task.chat_id)
+
+            if task.mode == "gpt":
+                res = await asyncio.wait_for(
+                    openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": task.prompt}],
+                    ),
+                    timeout=30,
+                )
+                await bot.send_message(task.chat_id, res.choices[0].message.content)
+                continue
+
+            if task.mode == "video":
+                output = await run_replicate(KLING_MODEL, {"prompt": task.prompt})
+                ext = "mp4"
+            elif task.mode == "image":
+                output = await run_replicate(IMAGE_MODEL, {"prompt": task.prompt})
+                ext = "jpg"
+            else:
+                output = await run_replicate(
+                    MUSIC_MODEL,
+                    {"prompt": task.prompt, "output_format": "mp3"},
+                )
+                ext = "mp3"
+
+            await send_replicate_output(task.chat_id, output, ext)
+
+        except asyncio.TimeoutError:
+            await bot.send_message(task.chat_id, "⏱ Таймаут запроса.")
+        except Exception:
+            logger.exception("Task failed")
+            await bot.send_message(task.chat_id, "❌ Ошибка обработки запроса.")
+        finally:
+            queue.task_done()
 
 # =========================
 # FASTAPI
