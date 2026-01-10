@@ -111,6 +111,17 @@ def main_keyboard() -> InlineKeyboardMarkup:
     )
 
 # =========================
+# STATUS HELPER
+# =========================
+async def update_status(status_msg: Message | None, text: str):
+    if not status_msg:
+        return
+    try:
+        await status_msg.edit_text(text)
+    except Exception:
+        pass
+
+# =========================
 # HANDLERS
 # =========================
 @dp.message(CommandStart())
@@ -149,7 +160,7 @@ async def run_replicate(model: str, payload: Dict[str, Any]) -> Any:
     )
 
 # =========================
-# OUTPUT HANDLER (FIX)
+# OUTPUT HANDLER
 # =========================
 async def send_replicate_output(
     chat_id: int,
@@ -208,10 +219,19 @@ async def worker(worker_id: int):
 
     while True:
         task: Task = await queue.get()
+        status_msg: Message | None = None
+
         try:
             logger.info("Processing %s for chat %s", task.mode, task.chat_id)
 
+            status_msg = await bot.send_message(
+                task.chat_id,
+                "🧠 Подготовка запроса…"
+            )
+
             if task.mode == "gpt":
+                await update_status(status_msg, "🤖 Генерация ответа GPT…")
+
                 res = await asyncio.wait_for(
                     openai_client.chat.completions.create(
                         model="gpt-4o-mini",
@@ -219,8 +239,18 @@ async def worker(worker_id: int):
                     ),
                     timeout=30,
                 )
-                await bot.send_message(task.chat_id, res.choices[0].message.content)
+
+                await bot.send_message(
+                    task.chat_id,
+                    res.choices[0].message.content,
+                )
+                await update_status(status_msg, "✅ Готово")
                 continue
+
+            await update_status(
+                status_msg,
+                "⚙️ Генерация контента (может занять до 1 минуты)…"
+            )
 
             if task.mode == "video":
                 output = await run_replicate(KLING_MODEL, {"prompt": task.prompt})
@@ -235,7 +265,9 @@ async def worker(worker_id: int):
                 )
                 ext = "mp3"
 
+            await update_status(status_msg, "📦 Загрузка результата…")
             await send_replicate_output(task.chat_id, output, ext)
+            await update_status(status_msg, "✅ Готово")
 
         except asyncio.TimeoutError:
             await bot.send_message(task.chat_id, "⏱ Таймаут запроса.")
