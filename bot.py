@@ -12,17 +12,17 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ================== ENV ==================
+# ================= ENV =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://bot-iivideo.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
 logging.basicConfig(level=logging.INFO)
 
-# ================== BOT ==================
+# ================= BOT =================
 
 bot = Bot(
     BOT_TOKEN,
@@ -30,19 +30,20 @@ bot = Bot(
 )
 
 dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-dp.include_router(router)
 
-# ================== FASTAPI ==================
+router = Router()
+dp.include_router(router)   # 🔥 ОБЯЗАТЕЛЬНО
+
+# ================= FASTAPI =================
 
 app = FastAPI()
 
-# ================== FSM ==================
+# ================= FSM =================
 
-class VideoFSM(StatesGroup):
-    waiting_prompt = State()
+class VideoState(StatesGroup):
+    prompt = State()
 
-# ================== KEYBOARD ==================
+# ================= KEYBOARD =================
 
 main_kb = InlineKeyboardMarkup(
     inline_keyboard=[
@@ -50,27 +51,25 @@ main_kb = InlineKeyboardMarkup(
     ]
 )
 
-# ================== HANDLERS ==================
+# ================= HANDLERS =================
 
 @router.message(F.text == "/start")
 async def start(message: Message):
     await message.answer(
-        "Привет 👋\n\nНажми кнопку ниже ⬇️",
+        "Нажми кнопку 👇",
         reply_markup=main_kb
     )
 
 @router.callback_query(F.data == "gen_video")
-async def ask_prompt(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(VideoFSM.waiting_prompt)
-    await callback.message.answer(
-        "✍️ Напиши описание видео\n<i>Пример: a woman is dancing</i>"
-    )
-    await callback.answer()
+async def callback_gen_video(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(VideoState.prompt)
+    await callback.message.answer("✍️ Напиши описание видео")
+    await callback.answer()  # 🔥 ОБЯЗАТЕЛЬНО
 
-@router.message(VideoFSM.waiting_prompt)
+@router.message(VideoState.prompt)
 async def generate_video(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("⏳ Генерирую видео, подожди...")
+    await message.answer("⏳ Генерирую видео...")
 
     try:
         output = replicate.run(
@@ -78,10 +77,8 @@ async def generate_video(message: Message, state: FSMContext):
             input={"prompt": message.text}
         )
 
-        video_url = output.url
-
         async with aiohttp.ClientSession() as session:
-            async with session.get(video_url) as resp:
+            async with session.get(output.url) as resp:
                 video = await resp.read()
 
         await message.answer_video(
@@ -94,7 +91,7 @@ async def generate_video(message: Message, state: FSMContext):
         logging.exception(e)
         await message.answer("❌ Ошибка генерации")
 
-# ================== WEBHOOK ==================
+# ================= WEBHOOK =================
 
 @app.on_event("startup")
 async def startup():
@@ -105,14 +102,13 @@ async def startup():
 async def shutdown():
     await bot.session.close()
 
-# 🔥 ВАЖНО: webhook на "/"
 @app.post("/")
 async def telegram_webhook(request: Request):
     update = await request.json()
     await dp.feed_raw_update(bot, update)
     return {"ok": True}
 
-# ================== LOCAL ==================
+# ================= LOCAL =================
 
 if __name__ == "__main__":
     import uvicorn
