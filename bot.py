@@ -34,25 +34,20 @@ dp.include_router(router)
 # ================== QUEUE ==================
 
 generation_queue: asyncio.Queue = asyncio.Queue()
-GENERATION_TIMEOUT = 120        # максимум ожидания генерации
-POLL_INTERVAL = 3               # секунд между запросами
+GENERATION_TIMEOUT = 120        # секунд
+POLL_INTERVAL = 3               # секунд
 MAX_POLLS = GENERATION_TIMEOUT // POLL_INTERVAL
 
 
 # ================== HELPERS ==================
 
 def extract_video_url(output: Any) -> str:
-    """
-    Универсальный парсер Kling / Replicate output
-    """
     if not output:
         raise RuntimeError("Empty output")
 
-    # строка
     if isinstance(output, str) and output.startswith("http"):
         return output
 
-    # список
     if isinstance(output, list):
         for item in output:
             try:
@@ -60,7 +55,6 @@ def extract_video_url(output: Any) -> str:
             except Exception:
                 pass
 
-    # dict
     if isinstance(output, dict):
         for key in ("video", "url", "output", "file"):
             if key in output:
@@ -69,16 +63,34 @@ def extract_video_url(output: Any) -> str:
     raise RuntimeError(f"Unknown Kling output format: {output}")
 
 
-async def wait_for_prediction(prediction):
+async def wait_for_prediction_with_progress(prediction, progress_message: Message):
     """
-    Polling Replicate с тайм-аутом
+    Polling Replicate + обновление прогресса
     """
-    for _ in range(MAX_POLLS):
+    for attempt in range(1, MAX_POLLS + 1):
         prediction.reload()
+
+        progress = int((attempt / MAX_POLLS) * 100)
+        progress = min(progress, 99)
+
+        try:
+            await progress_message.edit_text(
+                f"🎬 Генерация видео...\n"
+                f"⏳ Прогресс: <b>{progress}%</b>"
+            )
+        except Exception:
+            pass
+
         if prediction.status == "succeeded":
+            await progress_message.edit_text(
+                "🎬 Генерация завершена!\n"
+                "⏳ Прогресс: <b>100%</b>"
+            )
             return prediction
+
         if prediction.status == "failed":
             raise RuntimeError("Generation failed")
+
         await asyncio.sleep(POLL_INTERVAL)
 
     raise TimeoutError("Generation timeout")
@@ -90,16 +102,19 @@ async def generation_worker():
     while True:
         message, prompt = await generation_queue.get()
         try:
-            await message.answer("🎬 Генерирую видео, подожди...")
+            progress_message = await message.answer(
+                "🎬 Генерация видео...\n"
+                "⏳ Прогресс: <b>0%</b>"
+            )
 
             prediction = replicate.predictions.create(
                 version="kling-ai/kling-video:latest",
-                input={
-                    "prompt": prompt,
-                },
+                input={"prompt": prompt},
             )
 
-            prediction = await wait_for_prediction(prediction)
+            prediction = await wait_for_prediction_with_progress(
+                prediction, progress_message
+            )
 
             video_url = extract_video_url(prediction.output)
 
@@ -121,6 +136,7 @@ async def start(message: Message):
     await message.answer(
         "Привет 👋\n"
         "Отправь текст — я сгенерирую видео.\n"
+        "⏱ Прогресс будет отображаться в процентах.\n"
         "⚠️ Генерации идут по очереди."
     )
 
@@ -139,7 +155,7 @@ app = FastAPI()
 @app.on_event("startup")
 async def on_startup():
     asyncio.create_task(generation_worker())
-    logging.info("Worker started")
+    logging.info("Generation worker started")
 
 
 @app.post("/")
