@@ -33,9 +33,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-BASE_URL = os.getenv("BASE_URL")  # https://your-app.onrender.com
+BASE_URL = os.getenv("BASE_URL")  # https://xxx.onrender.com
 
-replicate.Client(api_token=REPLICATE_API_TOKEN)
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN not set")
+
+replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
@@ -100,66 +103,95 @@ async def handle_text(msg: Message):
 # WORKER
 # =========================
 async def worker():
-    while True:
-        mode, chat_id, prompt = await queue.get()
-        try:
-            if mode == "video":
-                output = replicate.run(KLING_MODEL, input={"prompt": prompt})
-                await send_file(chat_id, output, "mp4")
-
-            elif mode == "image":
-                output = replicate.run(IMAGE_MODEL, input={"prompt": prompt})
-                await send_file(chat_id, output[0], "jpg")
-
-            elif mode == "music":
-                output = replicate.run(MUSIC_MODEL, input={
-                    "prompt": prompt,
-                    "output_format": "mp3"
-                })
-                await send_file(chat_id, output, "mp3")
-
-            elif mode == "gpt":
-                res = await openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                await bot.send_message(chat_id, res.choices[0].message.content)
-
-        except Exception as e:
-            await bot.send_message(chat_id, f"❌ Ошибка: {e}")
-
-        queue.task_done()
-
-# =========================
-# SEND FILE
-# =========================
-async def send_file(chat_id: int, output, ext: str):
     async with aiohttp.ClientSession() as session:
-        async with session.get(output.url) as r:
-            data = await r.read()
+        while True:
+            mode, chat_id, prompt = await queue.get()
+            try:
+                if mode == "video":
+                    output = replicate_client.run(
+                        KLING_MODEL,
+                        input={"prompt": prompt}
+                    )
+                    url = extract_url(output)
+                    await send_file(chat_id, url, "mp4", session)
+
+                elif mode == "image":
+                    output = replicate_client.run(
+                        IMAGE_MODEL,
+                        input={"prompt": prompt}
+                    )
+                    url = extract_url(output)
+                    await send_file(chat_id, url, "jpg", session)
+
+                elif mode == "music":
+                    output = replicate_client.run(
+                        MUSIC_MODEL,
+                        input={"prompt": prompt, "output_format": "mp3"}
+                    )
+                    url = extract_url(output)
+                    await send_file(chat_id, url, "mp3", session)
+
+                elif mode == "gpt":
+                    res = await openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    await bot.send_message(
+                        chat_id,
+                        res.choices[0].message.content
+                    )
+
+            except Exception as e:
+                await bot.send_message(chat_id, f"❌ Ошибка: {e}")
+
+            queue.task_done()
+
+# =========================
+# HELPERS
+# =========================
+def extract_url(output) -> str:
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list) and output:
+        return output[0]
+    if hasattr(output, "url"):
+        return output.url
+    raise ValueError("Не удалось извлечь URL из ответа модели")
+
+async def send_file(chat_id: int, url: str, ext: str, session: aiohttp.ClientSession):
+    async with session.get(url) as r:
+        if r.status != 200:
+            raise RuntimeError("Ошибка загрузки файла")
+        data = await r.read()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as f:
         f.write(data)
         path = f.name
 
-    if ext == "mp4":
-        await bot.send_video(chat_id, FSInputFile(path))
-    elif ext == "jpg":
-        await bot.send_photo(chat_id, FSInputFile(path))
-    elif ext == "mp3":
-        await bot.send_audio(chat_id, FSInputFile(path))
-
-    os.remove(path)
+    try:
+        if ext == "mp4":
+            await bot.send_video(chat_id, FSInputFile(path))
+        elif ext == "jpg":
+            await bot.send_photo(chat_id, FSInputFile(path))
+        elif ext == "mp3":
+            await bot.send_audio(chat_id, FSInputFile(path))
+    finally:
+        os.remove(path)
 
 # =========================
-# FASTAPI (LIFESPAN)
+# FASTAPI
 # =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await bot.set_webhook(
-        f"{BASE_URL}/webhook",
-        secret_token=WEBHOOK_SECRET
-    )
+    if BASE_URL and BASE_URL.startswith("https://"):
+        await bot.set_webhook(
+            f"{BASE_URL}/webhook",
+            secret_token=WEBHOOK_SECRET
+        )
+        print("✅ Webhook установлен")
+    else:
+        print("⚠️ BASE_URL не задан или не https — webhook пропущен")
+
     asyncio.create_task(worker())
     yield
     await bot.session.close()
@@ -168,15 +200,16 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def telegram_webhook(req: Request):
-    if req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403)
+    if WEBHOOK_SECRET:
+        if req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403)
 
     update = await req.json()
     await dp.feed_raw_update(bot, update)
     return {"ok": True}
 
 # =========================
-# RUN SERVER
+# RUN
 # =========================
 if __name__ == "__main__":
     uvicorn.run(
