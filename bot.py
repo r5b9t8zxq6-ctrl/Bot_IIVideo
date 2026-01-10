@@ -126,8 +126,9 @@ async def select_mode(cb: CallbackQuery):
 
 @dp.message(F.text)
 async def handle_text(msg: Message):
-    mode = user_modes.pop(msg.from_user.id, None)
+    mode = user_modes.get(msg.from_user.id)
     if not mode:
+        await msg.answer("⚠️ Сначала выбери режим с помощью кнопок ниже.")
         return
 
     try:
@@ -185,8 +186,8 @@ async def worker(worker_id: int):
 
             except asyncio.TimeoutError:
                 await bot.send_message(task.chat_id, "⏱ Таймаут запроса.")
-            except Exception as e:
-                logger.exception("Task failed")
+            except Exception:
+                logger.exception("Task failed. Raw output: %r", output)
                 await bot.send_message(task.chat_id, "❌ Ошибка обработки запроса.")
             finally:
                 queue.task_done()
@@ -195,11 +196,27 @@ async def worker(worker_id: int):
 # HELPERS
 # =========================
 def extract_url(output: Any) -> str:
+    if not output:
+        raise ValueError("Empty model output")
+
     if isinstance(output, str):
         return output
-    if isinstance(output, list) and output and isinstance(output[0], str):
-        return output[0]
-    raise ValueError("Invalid model output")
+
+    if isinstance(output, list):
+        for item in output:
+            try:
+                return extract_url(item)
+            except ValueError:
+                pass
+
+    if isinstance(output, dict):
+        for value in output.values():
+            try:
+                return extract_url(value)
+            except ValueError:
+                pass
+
+    raise ValueError(f"Unsupported model output format: {type(output)}")
 
 async def download_and_send(
     chat_id: int,
