@@ -1,161 +1,168 @@
 import os
 import asyncio
 import logging
-from typing import Dict
+from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-
+import httpx
 import replicate
-from dotenv import load_dotenv
+from fastapi import FastAPI
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 
 # ================== CONFIG ==================
-load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-KLING_VERSION = "5c7d5dc6dd8bf75c1acaa8565735e7986bc5b66206b55cca93cb72c9bf15ccaa"
+KLING_MODEL = "kwaivgi/kling-v2.5-turbo-pro"
+FALLBACK_KLING_VERSION = "5c7d5dc6dd8bf75c1acaa8565735e7986bc5b66206b55cca93cb72c9bf15ccaa"
 
-GEN_TIMEOUT = 300        # максимум 5 минут
-RETRY_COUNT = 2
-QUEUE_LIMIT = 10
+MAX_RETRIES = 3
+POLL_INTERVAL = 5  # seconds
+
+# ============================================
 
 logging.basicConfig(level=logging.INFO)
 
-# ================== BOT ==================
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+app = FastAPI()
 
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# ================== FASTAPI ==================
-app = FastAPI()
+KLING_VERSION: Optional[str] = None
+generation_queue: asyncio.Queue = asyncio.Queue()
 
-# ================== QUEUE ==================
-generation_queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_LIMIT)
-active_jobs: Dict[int, asyncio.Event] = {}
 
-# ================== UTILS ==================
-async def safe_sleep(seconds: int):
+# ================== VERSION FETCH ==================
+
+async def fetch_latest_kling_version():
+    global KLING_VERSION
+
+    url = f"https://api.replicate.com/v1/models/{KLING_MODEL}"
+    headers = {"Authorization": f"Token {REPLICATE_API_TOKEN}"}
+
     try:
-        await asyncio.sleep(seconds)
-    except asyncio.CancelledError:
-        pass
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+
+            KLING_VERSION = data["latest_version"]["id"]
+            logging.info(f"✅ Kling latest_version loaded: {KLING_VERSION}")
+
+    except Exception as e:
+        KLING_VERSION = FALLBACK_KLING_VERSION
+        logging.error(f"❌ Failed to fetch Kling version: {e}")
+        logging.warning(f"⚠ Using fallback version: {KLING_VERSION}")
+
 
 # ================== GENERATION WORKER ==================
+
 async def generation_worker():
-    logging.info("Generation worker started")
+    logging.info("🚀 Generation worker started")
 
     while True:
-        message, prompt = await generation_queue.get()
-        chat_id = message.chat.id
+        task = await generation_queue.get()
+        chat_id, prompt = task
 
         try:
-            await bot.send_message(chat_id, "🎬 Генерация началась…\n0%")
+            await process_generation(chat_id, prompt)
+        except Exception as e:
+            await bot.send_message(chat_id, "❌ Ошибка генерации.\nМодель может быть перегружена.")
+            logging.error(e)
 
-            prediction = None
+        generation_queue.task_done()
 
-            for attempt in range(RETRY_COUNT + 1):
-                try:
-                    prediction = replicate_client.predictions.create(
-                        version=KLING_VERSION,
-                        input={
-                            "prompt": prompt,
-                            "duration": 5,
-                            "fps": 24
-                        }
-                    )
-                    break
-                except Exception as e:
-                    logging.error(f"Replicate error: {e}")
-                    if attempt >= RETRY_COUNT:
-                        raise
-                    await safe_sleep(3)
 
-            start_time = asyncio.get_event_loop().time()
+async def process_generation(chat_id: int, prompt: str):
+    if not KLING_VERSION:
+        raise RuntimeError("Kling version not loaded")
 
-            progress_msg = await bot.send_message(chat_id, "⏳ Прогресс: 5%")
+    await bot.send_message(chat_id, "🎬 Генерация началась (0%)")
 
-            last_percent = 5
-
-            while prediction.status not in ("succeeded", "failed"):
-                elapsed = asyncio.get_event_loop().time() - start_time
-
-                if elapsed > GEN_TIMEOUT:
-                    raise TimeoutError("Generation timeout")
-
-                prediction.reload()
-
-                percent = min(95, int((elapsed / GEN_TIMEOUT) * 100))
-                if percent - last_percent >= 5:
-                    last_percent = percent
-                    await progress_msg.edit_text(f"⏳ Прогресс: {percent}%")
-
-                await safe_sleep(2)
-
-            if prediction.status == "failed":
-                raise RuntimeError("Generation failed")
-
-            await progress_msg.edit_text("✅ Готово! 100%")
-
-            video_url = prediction.output
-
-            await bot.send_video(
-                chat_id=chat_id,
-                video=video_url,
-                caption="🎥 Видео сгенерировано"
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            prediction = replicate_client.predictions.create(
+                version=KLING_VERSION,
+                input={
+                    "prompt": prompt,
+                    "duration": 5,
+                    "fps": 24
+                }
             )
+
+            last_percent = -1
+
+            while prediction.status not in ("succeeded", "failed", "canceled"):
+                await asyncio.sleep(POLL_INTERVAL)
+
+                prediction = replicate_client.predictions.get(prediction.id)
+
+                percent = estimate_progress(prediction)
+                if percent != last_percent:
+                    await bot.send_message(chat_id, f"⏳ Прогресс: {percent}%")
+                    last_percent = percent
+
+            if prediction.status == "succeeded":
+                video_url = prediction.output[0]
+                await bot.send_message(chat_id, f"✅ Готово!\n{video_url}")
+                return
+
+            raise RuntimeError("Prediction failed")
 
         except Exception as e:
-            logging.exception(e)
-            await bot.send_message(
-                chat_id,
-                "❌ Ошибка генерации.\nВозможно, модель недоступна или перегружена."
-            )
+            logging.warning(f"Retry {attempt}/{MAX_RETRIES}: {e}")
+            if attempt == MAX_RETRIES:
+                raise
 
-        finally:
-            generation_queue.task_done()
 
-# ================== HANDLERS ==================
+def estimate_progress(prediction) -> int:
+    if prediction.status == "starting":
+        return 5
+    if prediction.status == "processing":
+        return 50
+    if prediction.status == "succeeded":
+        return 100
+    return 0
+
+
+# ================== BOT HANDLERS ==================
+
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    await message.answer(
+        "👋 Отправь текст — я сгенерирую видео через Kling.\n"
+        "Очередь: 1 видео за раз."
+    )
+
+
 @dp.message()
-async def handle_text(message: Message):
-    if generation_queue.full():
-        await message.answer("⛔ Очередь переполнена, попробуй позже")
-        return
-
-    prompt = message.text.strip()
-
-    await generation_queue.put((message, prompt))
+async def handle_prompt(message: types.Message):
+    await generation_queue.put((message.chat.id, message.text))
     await message.answer("📥 Запрос добавлен в очередь")
 
-# ================== WEBHOOK ==================
-@app.post("/")
-async def telegram_webhook(request: Request):
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403)
-
-    update = types.Update.model_validate(await request.json())
-    await dp.feed_update(bot, update)
-    return {"ok": True}
 
 # ================== STARTUP ==================
+
 @app.on_event("startup")
 async def on_startup():
-    await bot.set_webhook(
-        url=WEBHOOK_URL,
-        secret_token=WEBHOOK_SECRET
-    )
+    await fetch_latest_kling_version()
     asyncio.create_task(generation_worker())
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    await bot.delete_webhook()
+
+# ================== WEBHOOK HEALTHCHECK ==================
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+
+
+# ================== ENTRY ==================
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
