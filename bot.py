@@ -1,176 +1,223 @@
 import os
 import asyncio
-import aiohttp
+import uuid
 import tempfile
-from contextlib import asynccontextmanager
+import hashlib
+from typing import Dict, Any
+
+import aiohttp
+import replicate
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    FSInputFile,
+    FSInputFile
 )
 from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import CommandStart
 
 from fastapi import FastAPI, Request, HTTPException
-from openai import OpenAI
-import replicate
+from openai import AsyncOpenAI
 
-# ================= ENV =================
+# =========================
+# ENV
+# =========================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+BASE_URL = os.getenv("BASE_URL")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
+replicate.Client(api_token=REPLICATE_API_TOKEN)
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# ================= BOT =================
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
-
-# ================= GLOBAL =================
-queue = asyncio.Queue()
+# =========================
+# AI MODELS
+# =========================
 KLING_MODEL = "kwaivgi/kling-v2.5-turbo-pro"
-KLING_VERSION = None
+IMAGE_MODEL = "bytedance/seedream-4"
+MUSIC_MODEL = "meta/musicgen:671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb"
 
-# ================= UTILS =================
-async def download_to_file(url: str, suffix: str):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=300) as r:
-            r.raise_for_status()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-                f.write(await r.read())
-                return f.name
+# =========================
+# BOT
+# =========================
+bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+app = FastAPI()
 
+# очередь задач
+queue: asyncio.Queue = asyncio.Queue()
+tasks: Dict[str, Dict[str, Any]] = {}
 
-async def get_latest_kling_version():
-    url = f"https://api.replicate.com/v1/models/{KLING_MODEL}"
-    headers = {"Authorization": f"Token {REPLICATE_API_TOKEN}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as r:
-            data = await r.json()
-            return data["latest_version"]["id"]
-
-# ================= QUEUE WORKER =================
-async def queue_worker():
-    while True:
-        user_id, task = await queue.get()
-        try:
-            await process_task(user_id, task)
-        except Exception as e:
-            await bot.send_message(user_id, f"❌ Ошибка: {e}")
-        finally:
-            queue.task_done()
-
-# ================= TASK PROCESS =================
-async def process_task(user_id: int, task: str):
-    progress = await bot.send_message(user_id, "⏳ Генерация… 0%")
-
-    async def update(p):
-        await bot.edit_message_text(
-            f"⏳ Генерация… {p}%",
-            chat_id=user_id,
-            message_id=progress.message_id
-        )
-
-    await update(15)
-
-    if task == "video":
-        output = replicate_client.run(
-            f"{KLING_MODEL}:{KLING_VERSION}",
-            input={"prompt": "cinematic ultra realistic dramatic video"}
-        )
-        await update(70)
-        path = await download_to_file(output["video"], ".mp4")
-        await bot.send_video(user_id, FSInputFile(path), caption="🎬 Готово")
-
-    elif task == "image":
-        output = replicate_client.run(
-            "bytedance/seedream-4",
-            input={"prompt": "cinematic portrait, ultra detailed"}
-        )
-        path = await download_to_file(output[0].url, ".jpg")
-        await bot.send_photo(user_id, FSInputFile(path))
-
-    elif task == "music":
-        output = replicate_client.run(
-            "meta/musicgen:671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
-            input={
-                "prompt": "epic cinematic soundtrack",
-                "model_version": "stereo-large",
-                "output_format": "mp3"
-            }
-        )
-        path = await download_to_file(output.url, ".mp3")
-        await bot.send_audio(user_id, FSInputFile(path))
-
-    else:
-        response = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[{"role": "user", "content": task}]
-        )
-        await bot.send_message(user_id, response.choices[0].message.content)
-
-    await update(100)
-
-# ================= UI =================
-def keyboard():
+# =========================
+# KEYBOARD
+# =========================
+def main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🎬 Видео", callback_data="video"),
-            InlineKeyboardButton(text="🖼 Изображение", callback_data="image")
+            InlineKeyboardButton(text="🖼 Изображение", callback_data="image"),
         ],
         [
             InlineKeyboardButton(text="🎵 Музыка", callback_data="music"),
-            InlineKeyboardButton(text="🤖 GPT", callback_data="gpt")
+            InlineKeyboardButton(text="🤖 GPT-помощь", callback_data="gpt"),
         ]
     ])
 
-@router.message(F.text == "/start")
+# =========================
+# START
+# =========================
+@dp.message(CommandStart())
 async def start(msg: Message):
-    await msg.answer("🚀 AI Studio Bot", reply_markup=keyboard())
+    await msg.answer(
+        "🔥 <b>AI Studio Bot</b>\n\n"
+        "Выбери, что хочешь создать:",
+        reply_markup=main_keyboard()
+    )
 
-@router.callback_query()
-async def cb(call: CallbackQuery):
-    await call.answer()
-    await call.message.answer("✍️ Отправь запрос")
-    await queue.put((call.from_user.id, call.data))
+# =========================
+# CALLBACKS
+# =========================
+@dp.callback_query(F.data == "video")
+async def cb_video(cb: CallbackQuery):
+    await cb.message.answer("✍️ Опиши видео (Kling):")
+    tasks[cb.from_user.id] = {"mode": "video"}
 
-@router.message(F.text)
-async def text(msg: Message):
-    await msg.answer("⏳ Добавлено в очередь")
-    await queue.put((msg.from_user.id, msg.text))
+@dp.callback_query(F.data == "image")
+async def cb_image(cb: CallbackQuery):
+    await cb.message.answer("✍️ Опиши изображение:")
+    tasks[cb.from_user.id] = {"mode": "image"}
 
-# ================= FASTAPI LIFESPAN =================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global KLING_VERSION
-    KLING_VERSION = await get_latest_kling_version()
-    print("✅ Kling version:", KLING_VERSION)
-    asyncio.create_task(queue_worker())
-    await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
-    yield
+@dp.callback_query(F.data == "music")
+async def cb_music(cb: CallbackQuery):
+    await cb.message.answer("🎵 Опиши музыку (жанр, настроение):")
+    tasks[cb.from_user.id] = {"mode": "music"}
 
-app = FastAPI(lifespan=lifespan)
+@dp.callback_query(F.data == "gpt")
+async def cb_gpt(cb: CallbackQuery):
+    await cb.message.answer("🤖 Задай вопрос или попроси помощь:")
+    tasks[cb.from_user.id] = {"mode": "gpt"}
 
+# =========================
+# TEXT HANDLER
+# =========================
+@dp.message(F.text)
+async def handle_text(msg: Message):
+    state = tasks.get(msg.from_user.id)
+    if not state:
+        return
+
+    mode = state["mode"]
+    prompt = msg.text
+
+    if mode == "video":
+        job_id = str(uuid.uuid4())
+        await queue.put(("video", job_id, msg.chat.id, prompt))
+        await msg.answer("⏳ Видео добавлено в очередь…")
+
+    elif mode == "image":
+        job_id = str(uuid.uuid4())
+        await queue.put(("image", job_id, msg.chat.id, prompt))
+        await msg.answer("⏳ Генерация изображения…")
+
+    elif mode == "music":
+        job_id = str(uuid.uuid4())
+        await queue.put(("music", job_id, msg.chat.id, prompt))
+        await msg.answer("⏳ Генерация музыки…")
+
+    elif mode == "gpt":
+        completion = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Ты профессиональный AI-ассистент."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        await msg.answer(completion.choices[0].message.content)
+
+    tasks.pop(msg.from_user.id, None)
+
+# =========================
+# WORKER
+# =========================
+async def worker():
+    while True:
+        job = await queue.get()
+        kind, job_id, chat_id, prompt = job
+
+        try:
+            if kind == "video":
+                output = replicate.run(KLING_MODEL, input={
+                    "prompt": f"Cinematic, ultra realistic, 4k: {prompt}"
+                })
+                await send_file(chat_id, output, "mp4")
+
+            elif kind == "image":
+                output = replicate.run(IMAGE_MODEL, input={
+                    "prompt": f"Ultra detailed, professional photography: {prompt}"
+                })
+                await send_file(chat_id, output[0], "jpg")
+
+            elif kind == "music":
+                output = replicate.run(MUSIC_MODEL, input={
+                    "prompt": f"Professional cinematic music: {prompt}",
+                    "output_format": "mp3"
+                })
+                await send_file(chat_id, output, "mp3")
+
+        except Exception as e:
+            await bot.send_message(chat_id, f"❌ Ошибка: {e}")
+
+        queue.task_done()
+
+# =========================
+# SEND FILE (FSInputFile)
+# =========================
+async def send_file(chat_id: int, output, ext: str):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(output.url) as resp:
+            data = await resp.read()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as f:
+        f.write(data)
+        path = f.name
+
+    if ext == "mp4":
+        await bot.send_video(chat_id, FSInputFile(path))
+    elif ext == "jpg":
+        await bot.send_photo(chat_id, FSInputFile(path))
+    elif ext == "mp3":
+        await bot.send_audio(chat_id, FSInputFile(path))
+
+    os.remove(path)
+
+# =========================
+# WEBHOOK
+# =========================
 @app.post("/webhook")
-async def webhook(request: Request):
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+async def telegram_webhook(req: Request):
+    body = await req.body()
+    signature = req.headers.get("X-Telegram-Bot-Api-Secret-Token")
+
+    if signature != WEBHOOK_SECRET:
         raise HTTPException(status_code=403)
-    update = await request.json()
-    await dp.feed_raw_update(bot, update)
+
+    await dp.feed_raw_update(bot, body)
     return {"ok": True}
+
+# =========================
+# STARTUP
+# =========================
+@app.on_event("startup")
+async def on_startup():
+    await bot.set_webhook(
+        f"{BASE_URL}/webhook",
+        secret_token=WEBHOOK_SECRET
+    )
+    asyncio.create_task(worker())
