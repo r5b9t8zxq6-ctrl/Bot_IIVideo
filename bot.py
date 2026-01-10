@@ -9,13 +9,7 @@ from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Update,
-)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Update
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
@@ -63,9 +57,7 @@ class FlowState(StatesGroup):
 # ================= KEYBOARD =================
 
 main_kb = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text="🎬 TEXT → VIDEO", callback_data="text_video")]
-    ]
+    inline_keyboard=[[InlineKeyboardButton(text="🎬 TEXT → VIDEO", callback_data="text_video")]]
 )
 
 # ================= HELPERS =================
@@ -86,6 +78,13 @@ def get_latest_kling_version() -> str:
     model = replicate_client.models.get("kwaivgi/kling-v2.5-turbo-pro")
     return model.latest_version.id
 
+def extract_video_url(output) -> str:
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list) and output:
+        return output[0]
+    raise RuntimeError(f"Video URL not found. Output: {output}")
+
 # ================= GENERATION =================
 
 async def generate_video(chat_id: int, prompt: str):
@@ -102,8 +101,9 @@ async def generate_video(chat_id: int, prompt: str):
             },
         )
 
-        start = time.time()
         progress = 0
+        last_edit = time.time()
+        start_time = time.time()
 
         while True:
             await asyncio.sleep(3)
@@ -112,39 +112,22 @@ async def generate_video(chat_id: int, prompt: str):
             if prediction.status == "failed":
                 raise RuntimeError("Generation failed")
 
-            if prediction.status == "succeeded" and prediction.output:
+            if prediction.status == "succeeded":
                 break
 
-            if time.time() - start > 420:
+            if time.time() - start_time > 420:
                 raise TimeoutError("Generation timeout")
 
-            progress = min(progress + 5, 95)
-            try:
-                await msg.edit_text(f"⏳ Генерация… {progress}%")
-            except TelegramBadRequest:
-                pass
+            progress = min(progress + 4, 95)
 
-        # ================= OUTPUT PARSE =================
+            if time.time() - last_edit > 5:
+                try:
+                    await msg.edit_text(f"⏳ Генерация… {progress}%")
+                    last_edit = time.time()
+                except TelegramBadRequest:
+                    pass
 
-        output = prediction.output
-        video_url = None
-
-        if isinstance(output, str):
-            video_url = output
-
-        elif isinstance(output, list):
-            for item in output:
-                if isinstance(item, dict):
-                    video_url = item.get("video") or item.get("url")
-                    if video_url:
-                        break
-
-        elif isinstance(output, dict):
-            video_url = output.get("video") or output.get("url")
-
-        if not video_url:
-            raise RuntimeError(f"Video URL not found. Output: {output}")
-
+        video_url = extract_video_url(prediction.output)
         video_bytes = await download_file(video_url)
 
         await msg.delete()
@@ -155,11 +138,12 @@ async def generate_video(chat_id: int, prompt: str):
             reply_markup=main_kb,
         )
 
-    except Exception:
+    except Exception as e:
         logging.exception("❌ Generation error")
         try:
             await msg.edit_text(
-                "❌ Ошибка генерации.\nМодель может быть перегружена."
+                "❌ Ошибка генерации.\n"
+                "Модель может быть перегружена или видео не удалось получить."
             )
         except TelegramBadRequest:
             pass
@@ -173,7 +157,7 @@ async def generation_worker():
         try:
             await generate_video(chat_id, prompt)
         except Exception:
-            logging.exception("❌ Worker error prevented")
+            logging.exception("❌ Worker crash prevented")
         finally:
             generation_queue.task_done()
 
