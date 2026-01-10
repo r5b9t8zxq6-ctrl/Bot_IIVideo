@@ -115,13 +115,30 @@ async def generate_video(chat_id: int, prompt: str):
             except TelegramBadRequest:
                 pass
 
-        video_url = prediction.output
+        # ===== FIX: корректно извлекаем video_url =====
+        output = prediction.output
+
+        if isinstance(output, list) and output:
+            video_url = output[0].get("video") or output[0].get("url")
+        elif isinstance(output, dict):
+            video_url = output.get("video") or output.get("url")
+        else:
+            raise RuntimeError(f"Unexpected output format: {output}")
+
+        if not video_url:
+            raise RuntimeError("Video URL not found in output")
+
         video_bytes = await download_file(video_url)
 
         await msg.delete()
-        await bot.send_video(chat_id, video=video_bytes, caption="🎉 Видео готово!", reply_markup=main_kb)
+        await bot.send_video(
+            chat_id,
+            video=video_bytes,
+            caption="🎉 Видео готово!",
+            reply_markup=main_kb,
+        )
 
-    except Exception as e:
+    except Exception:
         logging.exception("❌ Generation error")
         try:
             await msg.edit_text("❌ Ошибка генерации.\nМодель может быть перегружена.")
