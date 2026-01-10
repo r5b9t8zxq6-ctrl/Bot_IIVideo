@@ -16,6 +16,7 @@ from aiogram.filters import Command
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://bot-iivideo.onrender.com
+PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN or not REPLICATE_API_TOKEN or not WEBHOOK_URL:
     raise RuntimeError("❌ Missing env variables")
@@ -40,7 +41,7 @@ replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 KLING_VERSION: Optional[str] = None
 generation_queue: asyncio.Queue = asyncio.Queue()
 
-# ================== VERSION FETCH ==================
+# ================== FETCH LATEST VERSION ==================
 
 async def fetch_latest_kling_version():
     global KLING_VERSION
@@ -52,7 +53,7 @@ async def fetch_latest_kling_version():
             r = await client.get(url, headers=headers)
             r.raise_for_status()
             KLING_VERSION = r.json()["latest_version"]["id"]
-            logging.info(f"✅ Kling version: {KLING_VERSION}")
+            logging.info(f"✅ Kling latest version: {KLING_VERSION}")
     except Exception as e:
         KLING_VERSION = FALLBACK_KLING_VERSION
         logging.error(f"❌ Version fetch failed: {e}")
@@ -67,12 +68,12 @@ async def generation_worker():
         try:
             await generate_video(chat_id, prompt)
         except Exception as e:
-            logging.error(e)
+            logging.exception(e)
             await bot.send_message(chat_id, "❌ Ошибка генерации. Попробуй позже.")
         generation_queue.task_done()
 
 async def generate_video(chat_id: int, prompt: str):
-    await bot.send_message(chat_id, "🎬 Генерация началась (0%)")
+    msg = await bot.send_message(chat_id, "🎬 Генерация началась (0%)")
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -85,13 +86,17 @@ async def generate_video(chat_id: int, prompt: str):
                 },
             )
 
+            progress = 0
             while prediction.status not in ("succeeded", "failed"):
                 await asyncio.sleep(POLL_INTERVAL)
                 prediction = replicate_client.predictions.get(prediction.id)
-                await bot.send_message(chat_id, f"⏳ Статус: {prediction.status}")
+
+                progress = min(progress + 10, 90)
+                await msg.edit_text(f"⏳ Генерация… {progress}%")
 
             if prediction.status == "succeeded":
-                await bot.send_message(chat_id, f"✅ Готово!\n{prediction.output[0]}")
+                await msg.edit_text("✅ Готово! 100%")
+                await bot.send_message(chat_id, prediction.output[0])
                 return
 
             raise RuntimeError("Prediction failed")
@@ -119,15 +124,11 @@ async def lifespan(app: FastAPI):
     await fetch_latest_kling_version()
     asyncio.create_task(generation_worker())
 
-    # ❗️УДАЛЯЕМ polling webhook если был
     await bot.delete_webhook(drop_pending_updates=True)
-
-    # ❗️УСТАНАВЛИВАЕМ webhook
     await bot.set_webhook(WEBHOOK_URL)
+
     logging.info("✅ Webhook установлен")
-
     yield
-
     await bot.session.close()
 
 app = FastAPI(lifespan=lifespan)
@@ -139,5 +140,15 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 @app.get("/")
-async def healthcheck():
+async def health():
     return {"status": "ok"}
+
+# ================== START SERVER ==================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "bot:app",
+        host="0.0.0.0",
+        port=PORT,
+    )
