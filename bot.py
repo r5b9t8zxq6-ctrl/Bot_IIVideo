@@ -11,6 +11,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import CommandStart
 
 # ================= ENV =================
 
@@ -30,9 +31,8 @@ bot = Bot(
 )
 
 dp = Dispatcher(storage=MemoryStorage())
-
 router = Router()
-dp.include_router(router)   # 🔥 ОБЯЗАТЕЛЬНО
+dp.include_router(router)
 
 # ================= FASTAPI =================
 
@@ -53,7 +53,7 @@ main_kb = InlineKeyboardMarkup(
 
 # ================= HANDLERS =================
 
-@router.message(F.text == "/start")
+@router.message(CommandStart())
 async def start(message: Message):
     await message.answer(
         "Нажми кнопку 👇",
@@ -64,7 +64,7 @@ async def start(message: Message):
 async def callback_gen_video(callback: CallbackQuery, state: FSMContext):
     await state.set_state(VideoState.prompt)
     await callback.message.answer("✍️ Напиши описание видео")
-    await callback.answer()  # 🔥 ОБЯЗАТЕЛЬНО
+    await callback.answer()
 
 @router.message(VideoState.prompt)
 async def generate_video(message: Message, state: FSMContext):
@@ -95,8 +95,11 @@ async def generate_video(message: Message, state: FSMContext):
 
 @app.on_event("startup")
 async def startup():
-    await bot.set_webhook(WEBHOOK_URL)
-    logging.info("✅ Webhook установлен")
+    await bot.set_webhook(
+        WEBHOOK_URL,
+        allowed_updates=dp.resolve_used_update_types()  # 🔥 КЛЮЧ
+    )
+    logging.info("✅ Webhook установлен с allowed_updates")
 
 @app.on_event("shutdown")
 async def shutdown():
