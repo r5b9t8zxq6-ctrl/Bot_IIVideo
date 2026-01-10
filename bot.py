@@ -4,6 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from collections import defaultdict
 
+import aiohttp
 import replicate
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, Router, F
@@ -13,6 +14,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     Update,
+    BufferedInputFile,
 )
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -38,6 +40,7 @@ bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
+
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
@@ -83,13 +86,7 @@ async def wait_prediction(
     timeout: int = 300,
     interval: int = 3,
 ):
-    """
-    Ожидание результата Replicate
-    timeout — максимальное время (сек)
-    interval — интервал опроса
-    """
     elapsed = 0
-
     while elapsed < timeout:
         pred = replicate_client.predictions.get(prediction_id)
 
@@ -104,6 +101,24 @@ async def wait_prediction(
 
     raise TimeoutError("Generation timeout")
 
+
+async def download_video_safe(url: str, max_mb: int = 45):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            size = int(resp.headers.get("Content-Length", 0))
+            if size and size > max_mb * 1024 * 1024:
+                return None
+
+            data = await resp.read()
+            return BufferedInputFile(data, filename="video.mp4")
+
+
+def extract_video_url(output):
+    if isinstance(output, list) and output:
+        return output[0]
+    if isinstance(output, dict):
+        return output.get("video")
+    raise RuntimeError("Unknown Kling output format")
 
 # ================= HANDLERS =================
 @router.message(CommandStart())
@@ -164,24 +179,34 @@ async def text_to_image_to_video(message: Message, state: FSMContext):
             )
 
             video_result = await wait_prediction(video_pred.id)
-            video_url = video_result.output[0]
+            video_url = extract_video_url(video_result.output)
+
+            video_file = await download_video_safe(video_url)
+
+            if not video_file:
+                await message.answer(
+                    "⚠️ Видео получилось слишком большим. "
+                    "Попробуй уменьшить длительность.",
+                    reply_markup=main_kb,
+                )
+                return
 
             await message.answer_video(
-                video=video_url,
+                video=video_file,
                 caption="🎉 Видео готово!",
                 reply_markup=main_kb,
             )
 
         except TimeoutError:
             await message.answer(
-                "⏳ Генерация заняла слишком много времени. Попробуй ещё раз.",
+                "⏳ Генерация заняла слишком много времени.",
                 reply_markup=main_kb,
             )
 
         except Exception as e:
             logging.exception(e)
             await message.answer(
-                "❌ Ошибка генерации. Попробуй позже.",
+                "❌ Ошибка генерации.",
                 reply_markup=main_kb,
             )
 
@@ -214,17 +239,26 @@ async def text_plus_image_to_video(message: Message, state: FSMContext):
             )
 
             video_result = await wait_prediction(video_pred.id)
-            video_url = video_result.output[0]
+            video_url = extract_video_url(video_result.output)
+
+            video_file = await download_video_safe(video_url)
+
+            if not video_file:
+                await message.answer(
+                    "⚠️ Видео получилось слишком большим.",
+                    reply_markup=main_kb,
+                )
+                return
 
             await message.answer_video(
-                video=video_url,
+                video=video_file,
                 caption="🎉 Видео готово!",
                 reply_markup=main_kb,
             )
 
         except TimeoutError:
             await message.answer(
-                "⏳ Видео генерировалось слишком долго. Попробуй ещё раз.",
+                "⏳ Видео генерировалось слишком долго.",
                 reply_markup=main_kb,
             )
 
