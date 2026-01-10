@@ -1,7 +1,10 @@
 import os
+import re
 import time
 import asyncio
 import logging
+import secrets
+import string
 import aiohttp
 import replicate
 
@@ -24,19 +27,35 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.filters import CommandStart
 from aiogram.exceptions import TelegramBadRequest
 
+# ================= LOGGING =================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
 # ================= ENV =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # ← ОБЯЗАТЕЛЬНО
 
-if not all([BOT_TOKEN, REPLICATE_API_TOKEN, WEBHOOK_URL, WEBHOOK_SECRET]):
-    raise RuntimeError("❌ Missing ENV variables")
+if not all([BOT_TOKEN, REPLICATE_API_TOKEN, WEBHOOK_URL]):
+    raise RuntimeError("❌ Missing required ENV variables")
 
 os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
-logging.basicConfig(level=logging.INFO)
+# ================= WEBHOOK SECRET SAFE =================
+
+def sanitize_webhook_secret(secret: str | None) -> str:
+    if secret and re.fullmatch(r"[A-Za-z0-9]{1,256}", secret):
+        return secret
+
+    logging.warning("⚠️ Invalid WEBHOOK_SECRET, generating safe one")
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(32))
+
+WEBHOOK_SECRET = sanitize_webhook_secret(os.getenv("WEBHOOK_SECRET"))
 
 # ================= BOT =================
 
@@ -55,6 +74,8 @@ replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
 generation_queue: asyncio.Queue = asyncio.Queue()
 KLING_VERSION: str | None = None
+MAX_RETRIES = 2
+GEN_TIMEOUT = 300  # 5 minutes
 
 # ================= FSM =================
 
@@ -73,13 +94,14 @@ main_kb = InlineKeyboardMarkup(
 
 def enhance_prompt(text: str) -> str:
     return (
-        "Ultra realistic cinematic scene. "
-        f"{text}. Natural lighting, 35mm, depth of field, dramatic motion."
+        "Ultra realistic cinematic scene, dramatic lighting, smooth camera motion. "
+        f"{text}. 35mm, depth of field, film grain."
     )
 
 async def download_file(url: str) -> bytes:
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
+            resp.raise_for_status()
             return await resp.read()
 
 def get_latest_kling_version() -> str:
@@ -91,59 +113,63 @@ def get_latest_kling_version() -> str:
 async def generate_video(chat_id: int, prompt: str):
     msg = await bot.send_message(chat_id, "⏳ Генерация… 0%")
 
-    try:
-        prediction = replicate_client.predictions.create(
-            version=KLING_VERSION,
-            input={
-                "prompt": enhance_prompt(prompt),
-                "duration": 5,
-                "fps": 24,
-            },
-        )
+    for attempt in range(1, MAX_RETRIES + 2):
+        try:
+            prediction = replicate_client.predictions.create(
+                version=KLING_VERSION,
+                input={
+                    "prompt": enhance_prompt(prompt),
+                    "duration": 5,
+                    "fps": 24,
+                },
+            )
 
-        last_progress = -1
-        start_time = time.time()
+            start_time = time.time()
+            last_progress = -1
 
-        while True:
-            prediction.reload()
+            while True:
+                prediction.reload()
 
-            if prediction.status == "failed":
-                raise RuntimeError("Generation failed")
+                if prediction.status == "failed":
+                    raise RuntimeError("Generation failed")
 
-            if prediction.status == "succeeded":
-                break
+                if prediction.status == "succeeded":
+                    break
 
-            # timeout 5 минут
-            if time.time() - start_time > 300:
-                raise TimeoutError("Generation timeout")
+                elapsed = time.time() - start_time
+                if elapsed > GEN_TIMEOUT:
+                    raise TimeoutError("Generation timeout")
 
-            # фейковый, но стабильный прогресс
-            progress = min(95, int((time.time() - start_time) / 3 * 10))
-            if progress != last_progress:
-                try:
-                    await msg.edit_text(f"⏳ Генерация… {progress}%")
-                except TelegramBadRequest:
-                    pass
-                last_progress = progress
+                progress = min(95, int(elapsed / GEN_TIMEOUT * 100))
+                if progress != last_progress:
+                    try:
+                        await msg.edit_text(f"⏳ Генерация… {progress}%")
+                    except TelegramBadRequest:
+                        pass
+                    last_progress = progress
 
-            await asyncio.sleep(3)
+                await asyncio.sleep(3)
 
-        output_url = prediction.output
-        video_bytes = await download_file(output_url)
+            output_url = prediction.output
+            video_bytes = await download_file(output_url)
 
-        await msg.delete()
-        await bot.send_video(
-            chat_id,
-            video=video_bytes,
-            caption="🎉 Видео готово!",
-            reply_markup=main_kb,
-        )
+            await msg.delete()
+            await bot.send_video(
+                chat_id,
+                video=video_bytes,
+                caption="🎉 Видео готово!",
+                reply_markup=main_kb,
+            )
+            return
 
-    except Exception as e:
-        logging.exception(e)
-        await msg.edit_text(
-            "❌ Ошибка генерации.\nВозможно, модель перегружена."
-        )
+        except Exception as e:
+            logging.exception(f"❌ Attempt {attempt} failed")
+            if attempt > MAX_RETRIES:
+                await msg.edit_text(
+                    "❌ Ошибка генерации.\nМодель перегружена или недоступна."
+                )
+                return
+            await asyncio.sleep(5)
 
 # ================= QUEUE WORKER =================
 
@@ -151,8 +177,10 @@ async def generation_worker():
     logging.info("✅ Generation worker started")
     while True:
         chat_id, prompt = await generation_queue.get()
-        await generate_video(chat_id, prompt)
-        generation_queue.task_done()
+        try:
+            await generate_video(chat_id, prompt)
+        finally:
+            generation_queue.task_done()
 
 # ================= HANDLERS =================
 
