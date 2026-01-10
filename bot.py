@@ -116,13 +116,14 @@ async def image_to_video(message: Message, state: FSMContext):
 
     try:
         output = replicate.run(
-            "kwaivgi/kling-v2.1",
-            input={
-                "image": image_url,
-                "prompt": "cinematic motion",
-                "duration": 5
-            }
-        )
+    "kwaivgi/kling-v2.1",
+    input={
+        "start_image": image_url,
+        "prompt": "cinematic motion",
+        "duration": 5,
+        "fps": 24
+    }
+)
 
         video = await download_file(output.url)
         await message.answer_video(video=video, reply_markup=main_kb)
@@ -143,34 +144,53 @@ async def text_image_video(callback: CallbackQuery, state: FSMContext):
 
 @router.message(GenState.image_prompt)
 async def text_to_image_to_video(message: Message, state: FSMContext):
+    import asyncio
+
     await message.answer("🎨 Генерирую изображение...")
 
     try:
+        # 1️⃣ TEXT → IMAGE
         image_output = replicate.run(
             "prunaai/flux-fast",
-            input={"prompt": message.text}
+            input={
+                "prompt": message.text,
+                "width": 1024,
+                "height": 1024
+            }
         )
 
         image_url = image_output.url
         await message.answer_photo(image_url, caption="🖼 Кадр готов")
 
+        # ⛔ ОБЯЗАТЕЛЬНАЯ ПАУЗА (иначе 429)
+        await asyncio.sleep(8)
+
         await message.answer("🎬 Генерирую видео...")
 
+        # 2️⃣ IMAGE → VIDEO (Kling)
         video_output = replicate.run(
             "kwaivgi/kling-v2.1",
             input={
-                "image": image_url,
-                "prompt": "smooth cinematic motion",
-                "duration": 5
+                "start_image": image_url,   # 🔴 КЛЮЧЕВО
+                "prompt": "smooth cinematic motion, camera movement",
+                "duration": 5,
+                "fps": 24
             }
         )
 
-        video = await download_file(video_output.url)
-        await message.answer_video(video=video, reply_markup=main_kb)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(video_output.url) as resp:
+                video_bytes = await resp.read()
+
+        await message.answer_video(
+            video=video_bytes,
+            caption="🎉 Видео готово!",
+            reply_markup=main_kb
+        )
 
     except Exception as e:
-        logging.exception(e)
-        await message.answer("❌ Ошибка генерации")
+        logging.exception("VIDEO ERROR")
+        await message.answer(f"❌ Ошибка генерации:\n<code>{e}</code>")
 
     await state.clear()
 
