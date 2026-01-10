@@ -9,7 +9,13 @@ from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Update
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    Update,
+)
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
@@ -57,7 +63,9 @@ class FlowState(StatesGroup):
 # ================= KEYBOARD =================
 
 main_kb = InlineKeyboardMarkup(
-    inline_keyboard=[[InlineKeyboardButton(text="🎬 TEXT → VIDEO", callback_data="text_video")]]
+    inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 TEXT → VIDEO", callback_data="text_video")]
+    ]
 )
 
 # ================= HELPERS =================
@@ -71,6 +79,7 @@ def enhance_prompt(text: str) -> str:
 async def download_file(url: str) -> bytes:
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
+            resp.raise_for_status()
             return await resp.read()
 
 def get_latest_kling_version() -> str:
@@ -103,10 +112,11 @@ async def generate_video(chat_id: int, prompt: str):
             if prediction.status == "failed":
                 raise RuntimeError("Generation failed")
 
-            if prediction.status == "succeeded":
+            # ✅ КЛЮЧЕВО: ждём не только succeeded, но и output
+            if prediction.status == "succeeded" and prediction.output:
                 break
 
-            if time.time() - start > 300:
+            if time.time() - start > 420:
                 raise TimeoutError("Generation timeout")
 
             progress = min(progress + 5, 95)
@@ -115,18 +125,23 @@ async def generate_video(chat_id: int, prompt: str):
             except TelegramBadRequest:
                 pass
 
-        # ===== FIX: корректно извлекаем video_url =====
-        output = prediction.output
+        # ================= OUTPUT PARSE =================
 
-        if isinstance(output, list) and output:
-            video_url = output[0].get("video") or output[0].get("url")
+        output = prediction.output
+        video_url = None
+
+        if isinstance(output, list):
+            for item in output:
+                if isinstance(item, dict):
+                    video_url = item.get("video") or item.get("url")
+                    if video_url:
+                        break
+
         elif isinstance(output, dict):
             video_url = output.get("video") or output.get("url")
-        else:
-            raise RuntimeError(f"Unexpected output format: {output}")
 
         if not video_url:
-            raise RuntimeError("Video URL not found in output")
+            raise RuntimeError(f"Video URL not found. Output: {output}")
 
         video_bytes = await download_file(video_url)
 
@@ -141,7 +156,9 @@ async def generate_video(chat_id: int, prompt: str):
     except Exception:
         logging.exception("❌ Generation error")
         try:
-            await msg.edit_text("❌ Ошибка генерации.\nМодель может быть перегружена.")
+            await msg.edit_text(
+                "❌ Ошибка генерации.\nМодель может быть перегружена."
+            )
         except TelegramBadRequest:
             pass
 
@@ -154,7 +171,7 @@ async def generation_worker():
         try:
             await generate_video(chat_id, prompt)
         except Exception:
-            logging.exception("❌ Worker crash prevented")
+            logging.exception("❌ Worker error prevented")
         finally:
             generation_queue.task_done()
 
