@@ -198,6 +198,7 @@ async def run_replicate(model: str, payload: Dict[str, Any]) -> Any:
 # =====================================================
 async def worker(worker_id: int):
     logger.info("Worker %s started", worker_id)
+
     while True:
         try:
             task = await asyncio.wait_for(queue.get(), timeout=5)
@@ -211,16 +212,26 @@ async def worker(worker_id: int):
                     input=task.prompt,
                 )
                 await bot.send_message(task.chat_id, r.output_text)
-
             else:
-                await bot.send_message(task.chat_id, "⚠️ Режим временно отключен")
+                await bot.send_message(
+                    task.chat_id,
+                    "⚠️ Режим временно отключен",
+                )
 
         except Exception:
             logger.exception("Worker error")
-            await bot.send_message(task.chat_id, "❌ Ошибка обработки")
+            await bot.send_message(
+                task.chat_id,
+                "❌ Ошибка обработки",
+            )
+
         finally:
-    user_tasks[task.user_id] -= 1
-    queue.task_done()
+            # 🔴 ВАЖНО: ЭТОТ БЛОК ДОЛЖЕН БЫТЬ ВЛОЖЕН
+            user_tasks[task.user_id] -= 1
+            if user_tasks[task.user_id] <= 0:
+                user_tasks.pop(task.user_id, None)
+
+            queue.task_done()
 
 # =====================================================
 # FASTAPI
