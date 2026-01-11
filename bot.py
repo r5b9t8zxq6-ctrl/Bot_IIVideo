@@ -21,7 +21,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://bot-iivideo.onrender.com
 WEBHOOK_PATH = "/webhook"
 FULL_WEBHOOK_URL = WEBHOOK_URL + WEBHOOK_PATH
 
@@ -64,20 +64,20 @@ def main_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton("🎬 Видео", callback_data="video"),
-                InlineKeyboardButton("🖼 Изображение", callback_data="image"),
+                InlineKeyboardButton(text="🎬 Видео", callback_data="video"),
+                InlineKeyboardButton(text="🖼 Изображение", callback_data="image"),
             ],
             [
-                InlineKeyboardButton("📸➡️🎬 Фото → Видео", callback_data="photo_video"),
+                InlineKeyboardButton(text="📸➡️🎬 Фото → Видео", callback_data="photo_video"),
             ],
             [
-                InlineKeyboardButton("🧠➡️🎬 GPT → Видео", callback_data="gpt_kling"),
+                InlineKeyboardButton(text="🧠➡️🎬 GPT → Видео", callback_data="gpt_kling"),
             ],
             [
-                InlineKeyboardButton("📸 Instagram", callback_data="instagram"),
+                InlineKeyboardButton(text="📸 Instagram", callback_data="instagram"),
             ],
             [
-                InlineKeyboardButton("💬 GPT", callback_data="gpt"),
+                InlineKeyboardButton(text="💬 GPT", callback_data="gpt"),
             ],
         ]
     )
@@ -87,14 +87,14 @@ def instagram_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    "🎬 Сценарий + субтитры",
-                    callback_data="insta_script"
+                    text="🎬 Сценарий + субтитры",
+                    callback_data="insta_script",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "🎙 Текст для озвучки",
-                    callback_data="insta_voice"
+                    text="🎙 Текст для озвучки",
+                    callback_data="insta_voice",
                 )
             ],
         ]
@@ -149,7 +149,6 @@ async def handle_photo(msg: Message):
 
     file = await bot.get_file(msg.photo[-1].file_id)
     user_photos[msg.from_user.id] = file.file_path
-
     await msg.answer("✍️ Теперь отправь описание видео")
 
 # ================== TEXT ==================
@@ -163,7 +162,6 @@ async def handle_text(msg: Message):
         await msg.answer("⚠️ Выбери режим через /start")
         return
 
-    # ===== PHOTO → VIDEO =====
     if mode == "photo_video":
         photo = user_photos.get(user_id)
         if not photo:
@@ -176,11 +174,9 @@ async def handle_text(msg: Message):
             "photo": photo,
             "prompt": msg.text,
         })
-
         await msg.answer("🎬 Генерирую видео...")
         return
 
-    # ===== INSTAGRAM =====
     if mode in {"insta_script", "insta_voice"}:
         await queue.put({
             "type": mode,
@@ -190,7 +186,6 @@ async def handle_text(msg: Message):
         await msg.answer("🧠 GPT генерирует контент...")
         return
 
-    # ===== GPT / VIDEO / IMAGE / GPT→KLING =====
     await queue.put({
         "type": mode,
         "chat_id": msg.chat.id,
@@ -203,95 +198,46 @@ async def handle_text(msg: Message):
 async def worker():
     while True:
         task = await queue.get()
-
         try:
-            # PHOTO → VIDEO
             if task["type"] == "photo_video":
                 photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{task['photo']}"
                 video = replicate_client.run(
                     KLING_MODEL,
-                    input={
-                        "image": photo_url,
-                        "prompt": task["prompt"],
-                    },
+                    input={"image": photo_url, "prompt": task["prompt"]},
                 )
                 await bot.send_video(task["chat_id"], video=video)
 
-            # GPT → VIDEO (KLING)
             elif task["type"] == "gpt_kling":
                 gpt = openai_client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "Создай короткий сценарий и визуальный prompt "
-                                "для генерации видео. Ответ строго:\n\n"
-                                "SCENARIO:\n...\n\nVIDEO_PROMPT:\n..."
-                            ),
-                        },
+                        {"role": "system", "content": "Создай сценарий и video prompt."},
                         {"role": "user", "content": task["prompt"]},
                     ],
                 )
-
-                content = gpt.choices[0].message.content
-                scenario, prompt = content.split("VIDEO_PROMPT:")
-
-                video = replicate_client.run(
-                    KLING_MODEL,
-                    input={"prompt": prompt.strip()},
-                )
-
+                prompt = gpt.choices[0].message.content
+                video = replicate_client.run(KLING_MODEL, input={"prompt": prompt})
                 await bot.send_video(task["chat_id"], video=video)
-                await bot.send_message(
-                    task["chat_id"],
-                    f"🎬 <b>Сценарий:</b>\n{scenario.replace('SCENARIO:', '').strip()}",
-                )
 
-            # INSTAGRAM — СЦЕНАРИЙ + СУБТИТРЫ
             elif task["type"] == "insta_script":
                 gpt = openai_client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "Ты Instagram-контент-мейкер.\n"
-                                "Создай:\n"
-                                "1. Сценарий Reels\n"
-                                "2. Субтитры построчно\n"
-                            ),
-                        },
+                        {"role": "system", "content": "Сценарий + субтитры Reels"},
                         {"role": "user", "content": task["topic"]},
                     ],
                 )
-                await bot.send_message(
-                    task["chat_id"],
-                    gpt.choices[0].message.content,
-                )
+                await bot.send_message(task["chat_id"], gpt.choices[0].message.content)
 
-            # INSTAGRAM — ОЗВУЧКА
             elif task["type"] == "insta_voice":
                 gpt = openai_client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "Создай короткий текст для озвучки Reels. "
-                                "Эмоционально, живо, до 30 секунд."
-                            ),
-                        },
+                        {"role": "system", "content": "Текст для озвучки Reels"},
                         {"role": "user", "content": task["topic"]},
                     ],
                 )
-                await bot.send_message(
-                    task["chat_id"],
-                    gpt.choices[0].message.content,
-                )
-
-            else:
-                await bot.send_message(task["chat_id"], "⚠️ Режим в разработке")
+                await bot.send_message(task["chat_id"], gpt.choices[0].message.content)
 
         except Exception as e:
             await bot.send_message(task["chat_id"], f"❌ Ошибка: {e}")
@@ -302,6 +248,7 @@ async def worker():
 
 @app.on_event("startup")
 async def startup():
+    print("🚀 STARTUP")
     await bot.set_webhook(FULL_WEBHOOK_URL)
     asyncio.create_task(worker())
 
@@ -312,15 +259,6 @@ async def shutdown():
 @app.post(WEBHOOK_PATH)
 async def webhook(request: Request):
     update = await request.json()
+    print("📩 INCOMING UPDATE:", update)
     await dp.feed_raw_update(bot, update)
     return {"ok": True}
-
-# ================== RUN ==================
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "bot:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-    )
