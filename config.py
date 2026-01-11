@@ -1,13 +1,18 @@
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing env var: {name}")
+    return value
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+BOT_TOKEN = require_env("BOT_TOKEN")
+REPLICATE_API_TOKEN = require_env("REPLICATE_API_TOKEN")
+OPENAI_API_KEY = require_env("OPENAI_API_KEY")
+WEBHOOK_URL = require_env("WEBHOOK_URL")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not set")
+WEBHOOK_PATH = "/webhook"
+FULL_WEBHOOK_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set")
+KLING_MODEL = "kwaivgi/kling-v2.5-turbo-pro"
+QUEUE_MAXSIZE = 100
