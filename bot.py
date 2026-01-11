@@ -11,6 +11,7 @@ from aiogram.types import (
 )
 from aiogram.enums import ParseMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+from aiogram.client.default import DefaultBotProperties
 from asyncio import Queue
 import replicate
 
