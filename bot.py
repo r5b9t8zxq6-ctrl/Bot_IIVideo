@@ -42,11 +42,19 @@ app = FastAPI()
 
 # ================== STATE ==================
 
-Mode = Literal["photo_video", "gpt_kling"]
+Mode = Literal[
+    "video",
+    "image",
+    "photo_video",
+    "gpt",
+    "gpt_kling",
+    "instagram",
+    "insta_script",
+    "insta_voice",
+]
 
 user_modes: Dict[int, Mode] = {}
 user_photos: Dict[int, str] = {}
-user_gpt_style: Dict[int, str] = {}
 
 queue: Queue = Queue()
 
@@ -56,30 +64,38 @@ def main_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="📸➡️🎬 Фото → Видео",
-                    callback_data="photo_video"
-                )
+                InlineKeyboardButton("🎬 Видео", callback_data="video"),
+                InlineKeyboardButton("🖼 Изображение", callback_data="image"),
             ],
             [
-                InlineKeyboardButton(
-                    text="🧠➡️🎬 GPT → Видео",
-                    callback_data="gpt_kling"
-                )
+                InlineKeyboardButton("📸➡️🎬 Фото → Видео", callback_data="photo_video"),
+            ],
+            [
+                InlineKeyboardButton("🧠➡️🎬 GPT → Видео", callback_data="gpt_kling"),
+            ],
+            [
+                InlineKeyboardButton("📸 Instagram", callback_data="instagram"),
+            ],
+            [
+                InlineKeyboardButton("💬 GPT", callback_data="gpt"),
             ],
         ]
     )
 
-def gpt_style_keyboard():
+def instagram_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton("🔥 Reels", callback_data="reels"),
-                InlineKeyboardButton("📢 Реклама", callback_data="ads"),
+                InlineKeyboardButton(
+                    "🎬 Сценарий + субтитры",
+                    callback_data="insta_script"
+                )
             ],
             [
-                InlineKeyboardButton("💪 Мотивация", callback_data="motivation"),
-                InlineKeyboardButton("📖 Story", callback_data="story"),
+                InlineKeyboardButton(
+                    "🎙 Текст для озвучки",
+                    callback_data="insta_voice"
+                )
             ],
         ]
     )
@@ -89,7 +105,7 @@ def gpt_style_keyboard():
 @dp.message(F.text == "/start")
 async def start(msg: Message):
     await msg.answer(
-        "🔥 <b>AI Video Generator</b>\n\nВыбери режим:",
+        "🔥 <b>AI Studio Bot</b>\n\nВыбери режим:",
         reply_markup=main_keyboard(),
     )
 
@@ -100,24 +116,27 @@ async def callbacks(call: CallbackQuery):
     user_id = call.from_user.id
     data = call.data
 
-    if data == "photo_video":
-        user_modes[user_id] = "photo_video"
-        await call.message.answer("📸 Отправь фото")
+    if data in {
+        "video", "image", "photo_video",
+        "gpt", "gpt_kling"
+    }:
+        user_modes[user_id] = data
+        await call.message.answer("✍️ Отправь описание")
         await call.answer()
         return
 
-    if data == "gpt_kling":
-        user_modes[user_id] = "gpt_kling"
+    if data == "instagram":
+        user_modes[user_id] = "instagram"
         await call.message.answer(
-            "🎬 Выбери стиль видео:",
-            reply_markup=gpt_style_keyboard(),
+            "📸 Instagram режим:",
+            reply_markup=instagram_keyboard(),
         )
         await call.answer()
         return
 
-    if data in {"reels", "ads", "motivation", "story"}:
-        user_gpt_style[user_id] = data
-        await call.message.answer("✍️ Напиши тему видео")
+    if data in {"insta_script", "insta_voice"}:
+        user_modes[user_id] = data
+        await call.message.answer("✍️ Напиши тему Reels")
         await call.answer()
         return
 
@@ -141,7 +160,7 @@ async def handle_text(msg: Message):
     mode = user_modes.get(user_id)
 
     if not mode:
-        await msg.answer("⚠️ Нажми /start и выбери режим")
+        await msg.answer("⚠️ Выбери режим через /start")
         return
 
     # ===== PHOTO → VIDEO =====
@@ -158,25 +177,26 @@ async def handle_text(msg: Message):
             "prompt": msg.text,
         })
 
-        await msg.answer("🎬 Генерирую видео из фото...")
+        await msg.answer("🎬 Генерирую видео...")
         return
 
-    # ===== GPT → KLING =====
-    if mode == "gpt_kling":
-        style = user_gpt_style.get(user_id)
-        if not style:
-            await msg.answer("⚠️ Выбери стиль")
-            return
-
+    # ===== INSTAGRAM =====
+    if mode in {"insta_script", "insta_voice"}:
         await queue.put({
-            "type": "gpt_kling",
+            "type": mode,
             "chat_id": msg.chat.id,
             "topic": msg.text,
-            "style": style,
         })
-
-        await msg.answer("🧠➡️🎬 GPT генерирует видео...")
+        await msg.answer("🧠 GPT генерирует контент...")
         return
+
+    # ===== GPT / VIDEO / IMAGE / GPT→KLING =====
+    await queue.put({
+        "type": mode,
+        "chat_id": msg.chat.id,
+        "prompt": msg.text,
+    })
+    await msg.answer("⏳ Запрос принят")
 
 # ================== WORKER ==================
 
@@ -185,56 +205,41 @@ async def worker():
         task = await queue.get()
 
         try:
-            # ===== PHOTO → VIDEO =====
+            # PHOTO → VIDEO
             if task["type"] == "photo_video":
                 photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{task['photo']}"
-
-                output = replicate_client.run(
+                video = replicate_client.run(
                     KLING_MODEL,
                     input={
                         "image": photo_url,
                         "prompt": task["prompt"],
                     },
                 )
+                await bot.send_video(task["chat_id"], video=video)
 
-                await bot.send_video(task["chat_id"], video=output)
-
-            # ===== GPT → KLING =====
-            if task["type"] == "gpt_kling":
-                style_prompt = {
-                    "reels": "короткое динамичное вирусное видео",
-                    "ads": "рекламное продающее видео",
-                    "motivation": "мотивационное вдохновляющее видео",
-                    "story": "сторителлинг видео с атмосферой",
-                }[task["style"]]
-
+            # GPT → VIDEO (KLING)
+            elif task["type"] == "gpt_kling":
                 gpt = openai_client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
                         {
                             "role": "system",
                             "content": (
-                                "Ты видеопродюсер.\n"
-                                "1. Создай короткий сценарий.\n"
-                                "2. Создай ВИЗУАЛЬНЫЙ prompt для видео-генерации (англ).\n"
-                                "Ответ строго в формате:\n\n"
-                                "SCENARIO:\n...\n\n"
-                                "VIDEO_PROMPT:\n..."
+                                "Создай короткий сценарий и визуальный prompt "
+                                "для генерации видео. Ответ строго:\n\n"
+                                "SCENARIO:\n...\n\nVIDEO_PROMPT:\n..."
                             ),
                         },
-                        {
-                            "role": "user",
-                            "content": f"{style_prompt}. Тема: {task['topic']}",
-                        },
+                        {"role": "user", "content": task["prompt"]},
                     ],
                 )
 
                 content = gpt.choices[0].message.content
-                scenario, video_prompt = content.split("VIDEO_PROMPT:")
+                scenario, prompt = content.split("VIDEO_PROMPT:")
 
                 video = replicate_client.run(
                     KLING_MODEL,
-                    input={"prompt": video_prompt.strip()},
+                    input={"prompt": prompt.strip()},
                 )
 
                 await bot.send_video(task["chat_id"], video=video)
@@ -242,6 +247,51 @@ async def worker():
                     task["chat_id"],
                     f"🎬 <b>Сценарий:</b>\n{scenario.replace('SCENARIO:', '').strip()}",
                 )
+
+            # INSTAGRAM — СЦЕНАРИЙ + СУБТИТРЫ
+            elif task["type"] == "insta_script":
+                gpt = openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты Instagram-контент-мейкер.\n"
+                                "Создай:\n"
+                                "1. Сценарий Reels\n"
+                                "2. Субтитры построчно\n"
+                            ),
+                        },
+                        {"role": "user", "content": task["topic"]},
+                    ],
+                )
+                await bot.send_message(
+                    task["chat_id"],
+                    gpt.choices[0].message.content,
+                )
+
+            # INSTAGRAM — ОЗВУЧКА
+            elif task["type"] == "insta_voice":
+                gpt = openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Создай короткий текст для озвучки Reels. "
+                                "Эмоционально, живо, до 30 секунд."
+                            ),
+                        },
+                        {"role": "user", "content": task["topic"]},
+                    ],
+                )
+                await bot.send_message(
+                    task["chat_id"],
+                    gpt.choices[0].message.content,
+                )
+
+            else:
+                await bot.send_message(task["chat_id"], "⚠️ Режим в разработке")
 
         except Exception as e:
             await bot.send_message(task["chat_id"], f"❌ Ошибка: {e}")
@@ -269,7 +319,6 @@ async def webhook(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(
         "bot:app",
         host="0.0.0.0",
