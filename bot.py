@@ -40,13 +40,11 @@ logger = logging.getLogger("ai-studio-bot")
 # =====================================================
 load_dotenv()
 
-
 def require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
         raise RuntimeError(f"ENV {name} is required")
     return value
-
 
 BOT_TOKEN = require_env("BOT_TOKEN")
 REPLICATE_API_TOKEN = require_env("REPLICATE_API_TOKEN")
@@ -64,9 +62,7 @@ WORKERS = int(os.getenv("WORKERS", "2"))
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Ограничиваем доступ к blocking API
 replicate_semaphore = asyncio.Semaphore(2)
-executor = asyncio.get_running_loop if False else None  # marker
 
 # =====================================================
 # BOT
@@ -87,7 +83,6 @@ IMAGE_MODEL = "bytedance/seedream-4"
 MUSIC_MODEL = "meta/musicgen:671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb"
 
 queue: asyncio.Queue["Task"] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
-
 user_modes: Dict[int, Mode] = {}
 user_locks: Dict[int, asyncio.Semaphore] = {}
 
@@ -102,7 +97,6 @@ class Task:
         self.chat_id = chat_id
         self.user_id = user_id
         self.prompt = prompt
-
 
 # =====================================================
 # KEYBOARD
@@ -131,12 +125,10 @@ async def start(msg: Message):
         reply_markup=main_keyboard(),
     )
 
-
 @dp.callback_query(F.data.in_({"video", "image", "music", "gpt"}))
 async def select_mode(cb: CallbackQuery):
     user_modes[cb.from_user.id] = cb.data  # type: ignore
     await cb.message.answer("✍️ Введите запрос:")
-
 
 @dp.message(F.text)
 async def handle_text(msg: Message):
@@ -145,8 +137,7 @@ async def handle_text(msg: Message):
         await msg.answer("⚠️ Сначала выбери режим кнопками ниже.")
         return
 
-    if msg.from_user.id not in user_locks:
-        user_locks[msg.from_user.id] = asyncio.Semaphore(1)
+    lock = user_locks.setdefault(msg.from_user.id, asyncio.Semaphore(1))
 
     if queue.full():
         await msg.answer("🚫 Очередь переполнена. Попробуйте позже.")
@@ -176,7 +167,7 @@ async def send_output(chat_id: int, output: Any, ext: str, session: aiohttp.Clie
     data: bytes | None = None
 
     if isinstance(output, FileOutput):
-        data = output.read()
+        data = await asyncio.to_thread(output.read)
 
     elif isinstance(output, str):
         async with session.get(output) as resp:
@@ -189,7 +180,7 @@ async def send_output(chat_id: int, output: Any, ext: str, session: aiohttp.Clie
             try:
                 return await send_output(chat_id, item, ext, session)
             except Exception:
-                pass
+                continue
 
     if not data:
         raise RuntimeError("Unsupported output")
@@ -217,40 +208,34 @@ async def worker(worker_id: int, session: aiohttp.ClientSession):
 
     while True:
         task = await queue.get()
-        lock = user_locks[task.user_id]
+        lock = user_locks.get(task.user_id)
 
-        async with lock:
-            try:
+        try:
+            async with lock:
                 if task.mode == "gpt":
                     res = await openai_client.responses.create(
                         model="gpt-4.1-mini",
                         input=task.prompt,
                     )
                     await bot.send_message(task.chat_id, res.output_text)
-                    continue
-
-                if task.mode == "video":
-                    output = await run_replicate(KLING_MODEL, {"prompt": task.prompt})
-                    ext = "mp4"
-                elif task.mode == "image":
-                    output = await run_replicate(IMAGE_MODEL, {"prompt": task.prompt})
-                    ext = "jpg"
                 else:
-                    output = await run_replicate(
-                        MUSIC_MODEL,
-                        {"prompt": task.prompt, "output_format": "mp3"},
-                    )
-                    ext = "mp3"
+                    if task.mode == "video":
+                        output, ext = await run_replicate(KLING_MODEL, {"prompt": task.prompt}), "mp4"
+                    elif task.mode == "image":
+                        output, ext = await run_replicate(IMAGE_MODEL, {"prompt": task.prompt}), "jpg"
+                    else:
+                        output, ext = await run_replicate(
+                            MUSIC_MODEL,
+                            {"prompt": task.prompt, "output_format": "mp3"},
+                        ), "mp3"
 
-                await send_output(task.chat_id, output, ext, session)
+                    await send_output(task.chat_id, output, ext, session)
 
-            except asyncio.TimeoutError:
-                await bot.send_message(task.chat_id, "⏱ Таймаут запроса.")
-            except Exception:
-                logger.exception("Task failed")
-                await bot.send_message(task.chat_id, "❌ Ошибка обработки.")
-            finally:
-                queue.task_done()
+        except Exception:
+            logger.exception("Task failed")
+            await bot.send_message(task.chat_id, "❌ Ошибка обработки.")
+        finally:
+            queue.task_done()
 
 # =====================================================
 # FASTAPI
@@ -258,30 +243,26 @@ async def worker(worker_id: int, session: aiohttp.ClientSession):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     session = aiohttp.ClientSession()
-
-    workers = [
-        asyncio.create_task(worker(i, session))
-        for i in range(WORKERS)
-    ]
+    workers = [asyncio.create_task(worker(i, session)) for i in range(WORKERS)]
 
     if BASE_URL and BASE_URL.startswith("https://"):
-        await bot.set_webhook(
-            f"{BASE_URL}/webhook",
-            secret_token=WEBHOOK_SECRET,
-        )
+        await bot.set_webhook(f"{BASE_URL}/webhook", secret_token=WEBHOOK_SECRET)
         logger.info("Webhook set")
 
     yield
 
     for w in workers:
         w.cancel()
+        await asyncio.gather(w, return_exceptions=True)
 
     await session.close()
     await bot.session.close()
 
-
 app = FastAPI(lifespan=lifespan)
 
+@app.get("/")
+async def health():
+    return {"status": "ok"}
 
 @app.post("/webhook")
 async def telegram_webhook(req: Request):
@@ -289,7 +270,12 @@ async def telegram_webhook(req: Request):
         if req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
             raise HTTPException(status_code=403)
 
-    await dp.feed_raw_update(bot, await req.json())
+    try:
+        update = await req.json()
+        await dp.feed_raw_update(bot, update)
+    except Exception:
+        logger.exception("Webhook error")
+
     return {"ok": True}
 
 # =====================================================
