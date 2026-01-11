@@ -26,7 +26,11 @@ replicate_client = replicate.Client(api_token=os.getenv("REPLICATE_API_TOKEN"))
 
 # ================== BOT ==================
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+
 dp = Dispatcher()
 
 app = FastAPI()
