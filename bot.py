@@ -201,43 +201,52 @@ async def run_replicate(model: str, payload: Dict[str, Any]) -> Any:
 # =====================================================
 # WORKER
 # =====================================================
-async def worker(worker_id: int):
+async def worker(worker_id: int, http: aiohttp.ClientSession):
     logger.info("Worker %s started", worker_id)
+
     while True:
         task = await queue.get()
         try:
             if task.mode == "video":
-    output = await run_replicate(
-        KLING_MODEL,
-        {
-            "prompt": task.prompt,
-            "images": task.images,  # 🔥 bytes напрямую
-            "style": task.style,
-            "duration": task.duration,
-            "aspect_ratio": "9:16",
-            "fps": 30,
-        },
-    )
-    await bot.send_video(task.chat_id, output)
+                output = await replicate_client.run(
+                    KLING_MODEL,
+                    input={
+                        "prompt": task.prompt,
+                        "images": task.images,   # ✅ bytes напрямую
+                        "style": task.style,
+                        "duration": task.duration,
+                        "aspect_ratio": "9:16",
+                        "fps": 30,
+                    },
+                )
+
+                await send_output(task.chat_id, output, "mp4", http)
 
             elif task.mode == "image":
-                out = await run_replicate(IMAGE_MODEL, {"prompt": task.prompt})
-                await bot.send_photo(task.chat_id, out)
+                output = await replicate_client.run(
+                    IMAGE_MODEL,
+                    input={"prompt": task.prompt},
+                )
+                await send_output(task.chat_id, output, "jpg", http)
 
             elif task.mode == "music":
-                out = await run_replicate(MUSIC_MODEL, {"prompt": task.prompt})
-                await bot.send_audio(task.chat_id, out)
+                output = await replicate_client.run(
+                    MUSIC_MODEL,
+                    input={"prompt": task.prompt},
+                )
+                await send_output(task.chat_id, output, "mp3", http)
 
-            else:
+            else:  # gpt
                 r = await openai_client.responses.create(
                     model="gpt-4.1-mini",
                     input=task.prompt,
                 )
                 await bot.send_message(task.chat_id, r.output_text)
 
-        except Exception:
+        except Exception as e:
             logger.exception("Worker error")
-            await bot.send_message(task.chat_id, "❌ Ошибка обработки")
+            await bot.send_message(task.chat_id, "❌ Ошибка обработки запроса")
+
         finally:
             queue.task_done()
 
