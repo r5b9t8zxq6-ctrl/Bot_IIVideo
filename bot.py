@@ -1,276 +1,174 @@
 import os
 import asyncio
-import logging
-import tempfile
-from typing import Any, Dict, Literal
-
-import aiohttp
-import replicate
-from replicate.helpers import FileOutput
-from dotenv import load_dotenv
-from contextlib import asynccontextmanager
-
+from typing import Dict, Literal
+from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
 from aiogram.types import (
     Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
-    FSInputFile,
+    InlineKeyboardMarkup,
+    CallbackQuery,
 )
-from aiogram.filters import CommandStart
-from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+from asyncio import Queue
+import replicate
 
-from fastapi import FastAPI, Request, HTTPException
-from openai import AsyncOpenAI
-import uvicorn
+# ================== CONFIG ==================
 
-# =========================
-# LOGGING
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("ai-studio-bot")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") + WEBHOOK_PATH
 
-# =========================
-# ENV
-# =========================
-load_dotenv()
+KLING_MODEL = "kwaivgi/kling-v2.5-turbo-pro"
 
-def require_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"ENV {name} is required")
-    return value
+replicate_client = replicate.Client(api_token=os.getenv("REPLICATE_API_TOKEN"))
 
-BOT_TOKEN = require_env("BOT_TOKEN")
-REPLICATE_API_TOKEN = require_env("REPLICATE_API_TOKEN")
-OPENAI_API_KEY = require_env("OPENAI_API_KEY")
+# ================== BOT ==================
 
-BASE_URL = os.getenv("BASE_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-
-# =========================
-# CLIENTS
-# =========================
-replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-# =========================
-# BOT
-# =========================
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
+bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# =========================
-# MODES
-# =========================
-Mode = Literal["video", "photo_video", "image", "music", "gpt"]
+app = FastAPI()
 
-# =========================
-# MODELS
-# =========================
-KLING_MODEL = "kwaivgi/kling-v2.5-turbo-pro"
-IMAGE_MODEL = "bytedance/seedream-4"
-MUSIC_MODEL = "meta/musicgen:671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb"
+# ================== STATE ==================
 
-# =========================
-# QUEUE & STATE
-# =========================
-queue: asyncio.Queue["Task"] = asyncio.Queue(maxsize=100)
-
-class Task:
-    def __init__(self, mode: Mode, chat_id: int, prompt: str):
-        self.mode = mode
-        self.chat_id = chat_id
-        self.prompt = prompt
+Mode = Literal["video", "image", "music", "gpt", "photo_video"]
 
 user_modes: Dict[int, Mode] = {}
 user_photos: Dict[int, str] = {}
 
-# =========================
-# KEYBOARD
-# =========================
-def main_keyboard() -> InlineKeyboardMarkup:
+queue: Queue = Queue()
+
+# ================== UI ==================
+
+def main_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton("🎬 Видео", callback_data="video"),
-                InlineKeyboardButton("📸➡️🎬 Фото → Видео", callback_data="photo_video"),
+                InlineKeyboardButton(text="🎬 Видео", callback_data="video"),
+                InlineKeyboardButton(text="🖼 Изображение", callback_data="image"),
             ],
             [
-                InlineKeyboardButton("🖼 Изображение", callback_data="image"),
-                InlineKeyboardButton("🎵 Музыка", callback_data="music"),
+                InlineKeyboardButton(text="📸➡️🎬 Фото → Видео", callback_data="photo_video"),
             ],
             [
-                InlineKeyboardButton("🤖 GPT", callback_data="gpt"),
+                InlineKeyboardButton(text="💬 GPT", callback_data="gpt"),
             ],
         ]
     )
 
-# =========================
-# GPT PROMPT ENHANCER
-# =========================
-async def enhance_prompt(prompt: str) -> str:
-    system = (
-        "You are a professional cinematic prompt engineer for AI video generation. "
-        "Rewrite the user prompt into a highly detailed cinematic video prompt. "
-        "Add camera movement, lighting, atmosphere, realism, motion, style. "
-        "Return ONLY the prompt text. No explanations."
-    )
+# ================== COMMANDS ==================
 
-    res = await openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.7,
-    )
-
-    return res.choices[0].message.content.strip()
-
-# =========================
-# HANDLERS
-# =========================
-@dp.message(CommandStart())
+@dp.message(F.text == "/start")
 async def start(msg: Message):
-    await msg.answer("🔥 AI Studio Bot\n\nВыбери режим:", reply_markup=main_keyboard())
+    await msg.answer(
+        "🔥 <b>AI Studio Bot</b>\n\nВыбери режим:",
+        reply_markup=main_keyboard(),
+    )
 
-@dp.callback_query(F.data.in_({"video", "photo_video", "image", "music", "gpt"}))
-async def select_mode(cb: CallbackQuery):
-    user_modes[cb.from_user.id] = cb.data  # type: ignore
-    if cb.data == "photo_video":
-        await cb.message.answer("📸 Отправь фото")
-    else:
-        await cb.message.answer("✍️ Введите запрос")
+# ================== CALLBACKS ==================
+
+@dp.callback_query()
+async def set_mode(call: CallbackQuery):
+    mode = call.data
+    user_modes[call.from_user.id] = mode
+
+    text = {
+        "video": "🎬 Отправь описание видео",
+        "image": "🖼 Отправь описание изображения",
+        "photo_video": "📸 Отправь фото",
+        "gpt": "💬 Напиши запрос",
+    }.get(mode, "Ок")
+
+    await call.message.answer(text)
+    await call.answer()
+
+# ================== PHOTO ==================
 
 @dp.message(F.photo)
-async def photo_handler(msg: Message):
+async def handle_photo(msg: Message):
     if user_modes.get(msg.from_user.id) != "photo_video":
         return
-    file = await bot.get_file(msg.photo[-1].file_id)
+
+    photo = msg.photo[-1]
+    file = await bot.get_file(photo.file_id)
+
     user_photos[msg.from_user.id] = file.file_path
     await msg.answer("✍️ Теперь отправь описание для видео")
 
+# ================== TEXT ==================
+
 @dp.message(F.text)
-async def text_handler(msg: Message):
+async def handle_text(msg: Message):
     mode = user_modes.get(msg.from_user.id)
     if not mode:
-        return await msg.answer("Выбери режим")
+        await msg.answer("⚠️ Сначала выбери режим")
+        return
 
+    # PHOTO + TEXT → VIDEO
     if mode == "photo_video":
-        photo = user_photos.get(msg.from_user.id)
-        if not photo:
-            return await msg.answer("Сначала фото")
-        combined = f"{msg.text}\nPHOTO:{photo}"
-        queue.put_nowait(Task(mode, msg.chat.id, combined))
-        return await msg.answer("🎬 Генерация запущена")
+        photo_path = user_photos.get(msg.from_user.id)
+        if not photo_path:
+            await msg.answer("📸 Сначала отправь фото")
+            return
 
-    queue.put_nowait(Task(mode, msg.chat.id, msg.text))
-    await msg.answer("⏳ Принято")
+        await queue.put(
+            {
+                "mode": "photo_video",
+                "chat_id": msg.chat.id,
+                "prompt": msg.text,
+                "photo": photo_path,
+            }
+        )
+        await msg.answer("🎬 Генерирую видео из фото...")
+        return
 
-# =========================
-# WORKER
-# =========================
+    await queue.put(
+        {
+            "mode": mode,
+            "chat_id": msg.chat.id,
+            "prompt": msg.text,
+        }
+    )
+    await msg.answer("⏳ Запрос принят")
+
+# ================== WORKER ==================
+
 async def worker():
     while True:
         task = await queue.get()
+
         try:
-            if task.mode in ("video", "photo_video"):
-                prompt = task.prompt
-                image_url = None
-
-                if task.mode == "photo_video":
-                    prompt, photo = prompt.split("\nPHOTO:", 1)
-                    image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{photo}"
-
-                enhanced = await enhance_prompt(prompt)
-
-                payload = {"prompt": enhanced}
-                if image_url:
-                    payload["image"] = image_url
-
-                output = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: replicate_client.run(KLING_MODEL, input=payload)
+            if task["mode"] == "photo_video":
+                photo_url = (
+                    f"https://api.telegram.org/file/bot{BOT_TOKEN}/{task['photo']}"
                 )
 
-                await send_output(task.chat_id, output, "mp4")
-
-            elif task.mode == "image":
-                out = replicate_client.run(IMAGE_MODEL, input={"prompt": task.prompt})
-                await send_output(task.chat_id, out, "jpg")
-
-            elif task.mode == "music":
-                out = replicate_client.run(
-                    MUSIC_MODEL, input={"prompt": task.prompt, "output_format": "mp3"}
+                output = replicate_client.run(
+                    KLING_MODEL,
+                    input={
+                        "prompt": task["prompt"],
+                        "image": photo_url,
+                    },
                 )
-                await send_output(task.chat_id, out, "mp3")
 
-            else:
-                res = await openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": task.prompt}],
-                )
-                await bot.send_message(task.chat_id, res.choices[0].message.content)
+                await bot.send_video(task["chat_id"], output)
 
-        except Exception:
-            logger.exception("Generation error")
-            await bot.send_message(task.chat_id, "❌ Ошибка")
-        finally:
-            queue.task_done()
+        except Exception as e:
+            await bot.send_message(task["chat_id"], f"❌ Ошибка: {e}")
 
-# =========================
-# SEND OUTPUT
-# =========================
-async def send_output(chat_id: int, output: Any, ext: str):
-    if isinstance(output, list):
-        output = output[0]
-    if isinstance(output, FileOutput):
-        data = output.read()
-    else:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(output) as r:
-                data = await r.read()
+        queue.task_done()
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as f:
-        f.write(data)
-        path = f.name
+# ================== WEBHOOK ==================
 
-    file = FSInputFile(path)
-    if ext == "mp4":
-        await bot.send_video(chat_id, file)
-    elif ext == "jpg":
-        await bot.send_photo(chat_id, file)
-    else:
-        await bot.send_audio(chat_id, file)
-    os.remove(path)
-
-# =========================
-# FASTAPI
-# =========================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    if BASE_URL:
-        await bot.set_webhook(f"{BASE_URL}/webhook", secret_token=WEBHOOK_SECRET)
+@app.on_event("startup")
+async def on_startup():
+    await bot.set_webhook(WEBHOOK_URL)
     asyncio.create_task(worker())
-    yield
-    await bot.session.close()
 
-app = FastAPI(lifespan=lifespan)
-
-@app.post("/webhook")
-async def webhook(req: Request):
-    if WEBHOOK_SECRET and req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        raise HTTPException(403)
-    await dp.feed_raw_update(bot, await req.json())
+@app.post(WEBHOOK_PATH)
+async def webhook(request: Request):
+    update = await request.json()
+    await dp.feed_raw_update(bot, update)
     return {"ok": True}
-
-if __name__ == "__main__":
-    uvicorn.run("bot:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
