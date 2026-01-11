@@ -10,7 +10,6 @@ from aiogram.types import (
     CallbackQuery,
 )
 from aiogram.enums import ParseMode
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.client.default import DefaultBotProperties
 from asyncio import Queue
 import replicate
@@ -18,27 +17,28 @@ import replicate
 # ================== CONFIG ==================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://xxx.onrender.com
 WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") + WEBHOOK_PATH
+FULL_WEBHOOK_URL = WEBHOOK_URL + WEBHOOK_PATH
 
 KLING_MODEL = "kwaivgi/kling-v2.5-turbo-pro"
 
-replicate_client = replicate.Client(api_token=os.getenv("REPLICATE_API_TOKEN"))
+replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 
-# ================== BOT ==================
+# ================== BOT / APP ==================
 
 bot = Bot(
     BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 
 dp = Dispatcher()
-
 app = FastAPI()
 
 # ================== STATE ==================
 
-Mode = Literal["video", "image", "music", "gpt", "photo_video"]
+Mode = Literal["video", "image", "gpt", "photo_video"]
 
 user_modes: Dict[int, Mode] = {}
 user_photos: Dict[int, str] = {}
@@ -47,18 +47,30 @@ queue: Queue = Queue()
 
 # ================== UI ==================
 
-def main_keyboard():
+def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🎬 Видео", callback_data="video"),
-                InlineKeyboardButton(text="🖼 Изображение", callback_data="image"),
+                InlineKeyboardButton(
+                    text="🎬 Видео",
+                    callback_data="video",
+                ),
+                InlineKeyboardButton(
+                    text="🖼 Изображение",
+                    callback_data="image",
+                ),
             ],
             [
-                InlineKeyboardButton(text="📸➡️🎬 Фото → Видео", callback_data="photo_video"),
+                InlineKeyboardButton(
+                    text="📸➡️🎬 Фото → Видео",
+                    callback_data="photo_video",
+                ),
             ],
             [
-                InlineKeyboardButton(text="💬 GPT", callback_data="gpt"),
+                InlineKeyboardButton(
+                    text="💬 GPT",
+                    callback_data="gpt",
+                ),
             ],
         ]
     )
@@ -79,14 +91,14 @@ async def set_mode(call: CallbackQuery):
     mode = call.data
     user_modes[call.from_user.id] = mode
 
-    text = {
+    text_map = {
         "video": "🎬 Отправь описание видео",
         "image": "🖼 Отправь описание изображения",
         "photo_video": "📸 Отправь фото",
         "gpt": "💬 Напиши запрос",
-    }.get(mode, "Ок")
+    }
 
-    await call.message.answer(text)
+    await call.message.answer(text_map.get(mode, "Ок"))
     await call.answer()
 
 # ================== PHOTO ==================
@@ -107,6 +119,7 @@ async def handle_photo(msg: Message):
 @dp.message(F.text)
 async def handle_text(msg: Message):
     mode = user_modes.get(msg.from_user.id)
+
     if not mode:
         await msg.answer("⚠️ Сначала выбери режим")
         return
@@ -158,7 +171,8 @@ async def worker():
                     },
                 )
 
-                await bot.send_video(task["chat_id"], output)
+                # Replicate возвращает URL видео
+                await bot.send_video(task["chat_id"], video=output)
 
         except Exception as e:
             await bot.send_message(task["chat_id"], f"❌ Ошибка: {e}")
@@ -169,11 +183,26 @@ async def worker():
 
 @app.on_event("startup")
 async def on_startup():
-    await bot.set_webhook(WEBHOOK_URL)
+    await bot.set_webhook(FULL_WEBHOOK_URL)
     asyncio.create_task(worker())
 
+@app.on_event("shutdown")
+async def on_shutdown():
+    await bot.delete_webhook()
+
 @app.post(WEBHOOK_PATH)
-async def webhook(request: Request):
+async def telegram_webhook(request: Request):
     update = await request.json()
     await dp.feed_raw_update(bot, update)
     return {"ok": True}
+
+# ================== RUN SERVER ==================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "bot:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+    )
