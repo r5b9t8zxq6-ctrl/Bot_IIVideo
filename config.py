@@ -1,18 +1,10 @@
+from dotenv import load_dotenv
 import os
-
-def require_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Missing env var: {name}")
-    return value
-
-BOT_TOKEN = require_env("BOT_TOKEN")
-REPLICATE_API_TOKEN = require_env("REPLICATE_API_TOKEN")
-OPENAI_API_KEY = require_env("OPENAI_API_KEY")
-WEBHOOK_URL = require_env("WEBHOOK_URL")
-
-WEBHOOK_PATH = "/webhook"
-FULL_WEBHOOK_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-
-KLING_MODEL = "kwaivgi/kling-v2.5-turbo-pro"
-QUEUE_MAXSIZE = 100
+load_dotenv()
+BOT_TOKEN = os getenv ("BOT_TOKEN")
+VE03_API_KEY = os. getenv ("VE03_API_KEY")
+YOOKASSA_SHOP_ID = os getenv ("YOOKASSA_SHOP_ID")
+YOOKASSA_API_KEY = os. getenv ("YO0KASSA_API_KEY")
+DOMAIN = os. getenv ("DOMAIN" )
+YOOMONEY_WALLET = os. getenv ("YOOMONEY_WALLET" )
+CHANNEL_USERNAME = os. getenv ( "CHANNEL_USERNAME")
