@@ -1,11 +1,17 @@
 import os
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import Dict, Literal, TypedDict, Optional
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
@@ -23,13 +29,13 @@ logging.basicConfig(
 logger = logging.getLogger("ai-studio-bot")
 
 # =========================================================
-# CONFIG VALIDATION
+# CONFIG
 # =========================================================
 
 def require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
-        raise RuntimeError(f"Missing required env var: {name}")
+        raise RuntimeError(f"Missing env var: {name}")
     return value
 
 
@@ -58,12 +64,10 @@ bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
-
 dp = Dispatcher()
-app = FastAPI()
 
 # =========================================================
-# TYPES
+# TYPES / STATE
 # =========================================================
 
 Mode = Literal[
@@ -86,10 +90,6 @@ class TaskPayload(TypedDict):
     photo: Optional[str]
 
 
-# =========================================================
-# STATE (bounded & safe)
-# =========================================================
-
 user_modes: Dict[int, Mode] = {}
 user_photos: Dict[int, str] = {}
 
@@ -106,18 +106,10 @@ def main_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🎬 Видео", callback_data="video"),
                 InlineKeyboardButton(text="🖼 Изображение", callback_data="image"),
             ],
-            [
-                InlineKeyboardButton(text="📸➡️🎬 Фото → Видео", callback_data="photo_video"),
-            ],
-            [
-                InlineKeyboardButton(text="🧠➡️🎬 GPT → Видео", callback_data="gpt_kling"),
-            ],
-            [
-                InlineKeyboardButton(text="📸 Instagram", callback_data="instagram"),
-            ],
-            [
-                InlineKeyboardButton(text="💬 GPT", callback_data="gpt"),
-            ],
+            [InlineKeyboardButton(text="📸➡️🎬 Фото → Видео", callback_data="photo_video")],
+            [InlineKeyboardButton(text="🧠➡️🎬 GPT → Видео", callback_data="gpt_kling")],
+            [InlineKeyboardButton(text="📸 Instagram", callback_data="instagram")],
+            [InlineKeyboardButton(text="💬 GPT", callback_data="gpt")],
         ]
     )
 
@@ -135,18 +127,15 @@ def instagram_keyboard() -> InlineKeyboardMarkup:
 # =========================================================
 
 @dp.message(F.text == "/start")
-async def start_handler(msg: Message) -> None:
+async def start(msg: Message):
     await msg.answer("🔥 <b>AI Studio Bot</b>\n\nВыбери режим:", reply_markup=main_keyboard())
 
 
 @dp.callback_query()
-async def callback_handler(call: CallbackQuery) -> None:
-    user_id = call.from_user.id
-    mode = call.data
+async def callbacks(call: CallbackQuery):
+    user_modes[call.from_user.id] = call.data
 
-    user_modes[user_id] = mode  # validated by UI
-
-    if mode == "instagram":
+    if call.data == "instagram":
         await call.message.answer("📸 Instagram режим:", reply_markup=instagram_keyboard())
     else:
         await call.message.answer("✍️ Отправь описание")
@@ -155,7 +144,7 @@ async def callback_handler(call: CallbackQuery) -> None:
 
 
 @dp.message(F.photo)
-async def photo_handler(msg: Message) -> None:
+async def photo_handler(msg: Message):
     if user_modes.get(msg.from_user.id) != "photo_video":
         return
 
@@ -165,34 +154,24 @@ async def photo_handler(msg: Message) -> None:
 
 
 @dp.message(F.text)
-async def text_handler(msg: Message) -> None:
-    user_id = msg.from_user.id
-    mode = user_modes.get(user_id)
-
+async def text_handler(msg: Message):
+    mode = user_modes.get(msg.from_user.id)
     if not mode:
         await msg.answer("⚠️ Выбери режим через /start")
         return
 
-    payload: TaskPayload = {
+    task: TaskPayload = {
         "type": mode,
         "chat_id": msg.chat.id,
-        "prompt": None,
-        "topic": None,
-        "photo": None,
+        "prompt": msg.text,
+        "topic": msg.text,
+        "photo": user_photos.get(msg.from_user.id),
     }
 
-    if mode == "photo_video":
-        payload["photo"] = user_photos.get(user_id)
-        payload["prompt"] = msg.text
-    elif mode in {"insta_script", "insta_voice"}:
-        payload["topic"] = msg.text
-    else:
-        payload["prompt"] = msg.text
-
     try:
-        queue.put_nowait(payload)
+        queue.put_nowait(task)
     except asyncio.QueueFull:
-        await msg.answer("⏳ Сервер перегружен, попробуй позже")
+        await msg.answer("⏳ Сервер перегружен")
         return
 
     await msg.answer("⏳ Запрос принят")
@@ -201,82 +180,58 @@ async def text_handler(msg: Message) -> None:
 # WORKER
 # =========================================================
 
-async def worker() -> None:
+async def worker():
     logger.info("Worker started")
-
     while True:
         task = await queue.get()
         try:
-            await process_task(task)
-        except asyncio.CancelledError:
-            raise
+            await asyncio.to_thread(
+                replicate_client.run,
+                KLING_MODEL,
+                {"prompt": task.get("prompt")},
+            )
+            await bot.send_message(task["chat_id"], "✅ Готово")
         except Exception:
-            logger.exception("Task failed")
-            await bot.send_message(task["chat_id"], "❌ Внутренняя ошибка")
+            logger.exception("Worker error")
+            await bot.send_message(task["chat_id"], "❌ Ошибка")
         finally:
             queue.task_done()
 
-
-async def process_task(task: TaskPayload) -> None:
-    t = task["type"]
-
-    if t == "photo_video":
-        photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{task['photo']}"
-        video = await asyncio.to_thread(
-            replicate_client.run,
-            KLING_MODEL,
-            {"image": photo_url, "prompt": task["prompt"]},
-        )
-        await bot.send_video(task["chat_id"], video)
-
-    elif t == "gpt_kling":
-        gpt = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Создай сценарий и video prompt."},
-                {"role": "user", "content": task["prompt"]},
-            ],
-        )
-        prompt = gpt.choices[0].message.content
-        video = await asyncio.to_thread(
-            replicate_client.run,
-            KLING_MODEL,
-            {"prompt": prompt},
-        )
-        await bot.send_video(task["chat_id"], video)
-
-    elif t in {"insta_script", "insta_voice"}:
-        gpt = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Контент для Reels"},
-                {"role": "user", "content": task["topic"]},
-            ],
-        )
-        await bot.send_message(task["chat_id"], gpt.choices[0].message.content)
-
 # =========================================================
-# FASTAPI LIFECYCLE
+# FASTAPI LIFESPAN
 # =========================================================
 
-@app.on_event("startup")
-async def startup() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     logger.info("Startup")
     await bot.set_webhook(FULL_WEBHOOK_URL)
-    app.state.worker_task = asyncio.create_task(worker())
+    worker_task = asyncio.create_task(worker())
 
+    yield
 
-@app.on_event("shutdown")
-async def shutdown() -> None:
     logger.info("Shutdown")
-    app.state.worker_task.cancel()
+    worker_task.cancel()
     await bot.delete_webhook()
 
 
+app = FastAPI(lifespan=lifespan)
+
 @app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
+async def webhook(request: Request):
     update = await request.json()
     await dp.feed_raw_update(bot, update)
     return {"ok": True}
+
+# =========================================================
+# ENTRYPOINT (если python bot.py)
+# =========================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "bot:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+        log_level="info",
+    )
