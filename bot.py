@@ -1,28 +1,21 @@
 # ===========================
-# bot.py — Production Ready
+# bot.py — Production Ready (FIXED)
 # ===========================
 import os
 import asyncio
 import logging
-import tempfile
-from contextlib import asynccontextmanager, ExitStack
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, List, Optional
 
 import aiohttp
 import replicate
-from replicate.helpers import FileOutput
+from replicate.helpers import File, FileOutput
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    FSInputFile,
-)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
 
@@ -45,10 +38,10 @@ logger = logging.getLogger("ai-studio-bot")
 load_dotenv()
 
 def require_env(name: str) -> str:
-    val = os.getenv(name)
-    if not val:
+    v = os.getenv(name)
+    if not v:
         raise RuntimeError(f"ENV {name} is required")
-    return val
+    return v
 
 BOT_TOKEN = require_env("BOT_TOKEN")
 REPLICATE_API_TOKEN = require_env("REPLICATE_API_TOKEN")
@@ -95,7 +88,6 @@ class UserSession:
     images: List[bytes] = field(default_factory=list)
     style: str = "cinematic"
     duration: int = 5
-    lock: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
 
 sessions: Dict[int, UserSession] = {}
 
@@ -110,46 +102,36 @@ class Task:
     mode: Mode
     chat_id: int
     prompt: str
-    images: List[bytes] = field(default_factory=list)
-    style: str = "cinematic"
-    duration: int = 5
+    images: List[bytes]
+    style: str
+    duration: int
 
 queue: asyncio.Queue[Task] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
 
 # =====================================================
-# KEYBOARDS (aiogram v3 compatible)
+# KEYBOARDS
 # =====================================================
-def main_keyboard() -> InlineKeyboardMarkup:
+def main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🎬 Видео", callback_data="video"),
-            InlineKeyboardButton(text="🖼 Изображение", callback_data="image"),
-        ],
-        [
-            InlineKeyboardButton(text="🎵 Музыка", callback_data="music"),
-            InlineKeyboardButton(text="🤖 GPT", callback_data="gpt"),
-        ],
+        [InlineKeyboardButton(text="🎬 Видео", callback_data="video"),
+         InlineKeyboardButton(text="🖼 Изображение", callback_data="image")],
+        [InlineKeyboardButton(text="🎵 Музыка", callback_data="music"),
+         InlineKeyboardButton(text="🤖 GPT", callback_data="gpt")],
     ])
 
-def style_keyboard() -> InlineKeyboardMarkup:
+def style_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🎬 Cinematic", callback_data="style_cinematic"),
-            InlineKeyboardButton(text="🎨 Anime", callback_data="style_anime"),
-        ],
-        [
-            InlineKeyboardButton(text="🤖 Cyberpunk", callback_data="style_cyberpunk"),
-            InlineKeyboardButton(text="📸 Realistic", callback_data="style_realistic"),
-        ],
+        [InlineKeyboardButton(text="🎬 Cinematic", callback_data="style_cinematic"),
+         InlineKeyboardButton(text="🎨 Anime", callback_data="style_anime")],
+        [InlineKeyboardButton(text="🤖 Cyberpunk", callback_data="style_cyberpunk"),
+         InlineKeyboardButton(text="📸 Realistic", callback_data="style_realistic")],
     ])
 
-def duration_keyboard() -> InlineKeyboardMarkup:
+def duration_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="⏱ 5 сек", callback_data="dur_5"),
-            InlineKeyboardButton(text="⏱ 10 сек", callback_data="dur_10"),
-            InlineKeyboardButton(text="⏱ 15 сек", callback_data="dur_15"),
-        ]
+        [InlineKeyboardButton(text="⏱ 5 сек", callback_data="dur_5"),
+         InlineKeyboardButton(text="⏱ 10 сек", callback_data="dur_10"),
+         InlineKeyboardButton(text="⏱ 15 сек", callback_data="dur_15")],
     ])
 
 # =====================================================
@@ -165,9 +147,7 @@ async def select_mode(cb: CallbackQuery):
     s = get_session(cb.from_user.id)
     s.mode = cb.data  # type: ignore
     s.images.clear()
-    await cb.message.answer(
-        "📸 Отправь 1–5 фото" if cb.data == "video" else "✍️ Введите запрос"
-    )
+    await cb.message.answer("📸 Отправь 1–5 фото" if cb.data == "video" else "✍️ Введите запрос")
 
 @dp.message(F.photo)
 async def handle_photo(msg: Message):
@@ -184,12 +164,12 @@ async def handle_photo(msg: Message):
 
 @dp.callback_query(F.data.startswith("style_"))
 async def set_style(cb: CallbackQuery):
-    get_session(cb.from_user.id).style = cb.data.removeprefix("style_")
+    get_session(cb.from_user.id).style = cb.data.replace("style_", "")
     await cb.message.answer("⏱ Выбери длительность", reply_markup=duration_keyboard())
 
 @dp.callback_query(F.data.startswith("dur_"))
 async def set_duration(cb: CallbackQuery):
-    get_session(cb.from_user.id).duration = int(cb.data.removeprefix("dur_"))
+    get_session(cb.from_user.id).duration = int(cb.data.replace("dur_", ""))
     await cb.message.answer("✍️ Теперь введи текст")
 
 @dp.message(F.text)
@@ -197,9 +177,6 @@ async def handle_text(msg: Message):
     s = get_session(msg.from_user.id)
     if not s.mode:
         await msg.answer("⚠️ Сначала выбери режим")
-        return
-    if queue.full():
-        await msg.answer("🚫 Очередь перегружена")
         return
     await queue.put(Task(
         mode=s.mode,
@@ -212,42 +189,50 @@ async def handle_text(msg: Message):
     await msg.answer("⏳ Запрос принят")
 
 # =====================================================
+# REPLICATE WRAPPER
+# =====================================================
+async def run_replicate(model: str, payload: Dict[str, Any]) -> Any:
+    async with replicate_semaphore:
+        return await asyncio.wait_for(
+            asyncio.to_thread(replicate_client.run, model, input=payload),
+            timeout=420,
+        )
+
+# =====================================================
 # WORKER
 # =====================================================
-async def worker(worker_id: int, http: aiohttp.ClientSession):
+async def worker(worker_id: int):
     logger.info("Worker %s started", worker_id)
     while True:
         task = await queue.get()
         try:
             if task.mode == "video":
-                with ExitStack() as stack:
-                    files = []
-                    for img in task.images:
-                        f = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                        f.write(img)
-                        f.close()
-                        files.append(stack.enter_context(open(f.name, "rb")))
+                images = [
+                    File(data=img, filename="frame.jpg", content_type="image/jpeg")
+                    for img in task.images
+                ]
 
-                    output = await replicate_client.run(
-                        KLING_MODEL,
-                        input={
-                            "prompt": task.prompt,
-                            "images": files,
-                            "style": task.style,
-                            "duration": task.duration,
-                            "aspect_ratio": "9:16",
-                            "fps": 30,
-                        },
-                    )
-                await send_output(task.chat_id, output, "mp4", http)
+                output = await run_replicate(
+                    KLING_MODEL,
+                    {
+                        "prompt": task.prompt,
+                        "images": images,
+                        "style": task.style,
+                        "duration": task.duration,
+                        "aspect_ratio": "9:16",
+                        "fps": 30,
+                    },
+                )
+
+                await bot.send_video(task.chat_id, output)
 
             elif task.mode == "image":
-                o = await replicate_client.run(IMAGE_MODEL, input={"prompt": task.prompt})
-                await send_output(task.chat_id, o, "jpg", http)
+                out = await run_replicate(IMAGE_MODEL, {"prompt": task.prompt})
+                await bot.send_photo(task.chat_id, out)
 
             elif task.mode == "music":
-                o = await replicate_client.run(MUSIC_MODEL, input={"prompt": task.prompt})
-                await send_output(task.chat_id, o, "mp3", http)
+                out = await run_replicate(MUSIC_MODEL, {"prompt": task.prompt})
+                await bot.send_audio(task.chat_id, out)
 
             else:
                 r = await openai_client.responses.create(
@@ -267,10 +252,9 @@ async def worker(worker_id: int, http: aiohttp.ClientSession):
 # =====================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    http = aiohttp.ClientSession()
-    workers = [asyncio.create_task(worker(i, http)) for i in range(WORKERS)]
+    workers = [asyncio.create_task(worker(i)) for i in range(WORKERS)]
 
-    if BASE_URL and BASE_URL.startswith("https://"):
+    if BASE_URL:
         await bot.set_webhook(f"{BASE_URL}/webhook", secret_token=WEBHOOK_SECRET)
 
     yield
@@ -278,22 +262,16 @@ async def lifespan(app: FastAPI):
     for w in workers:
         w.cancel()
     await asyncio.gather(*workers, return_exceptions=True)
-    await bot.delete_webhook(drop_pending_updates=True)
-    await http.close()
     await bot.session.close()
 
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def webhook(req: Request):
-    try:
-        if WEBHOOK_SECRET and req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-            raise HTTPException(403)
-        await dp.feed_raw_update(bot, await req.json())
-        return {"ok": True}
-    except Exception:
-        logger.exception("Webhook error")
-        raise
+    if WEBHOOK_SECRET and req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        raise HTTPException(403)
+    await dp.feed_raw_update(bot, await req.json())
+    return {"ok": True}
 
 # =====================================================
 # RUN
