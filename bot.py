@@ -1,30 +1,12 @@
-async def worker():
-    logger.info("Worker started")
+from aiogram import Bot, Dispatcher
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
-    while True:
-        task = await queue.get()
-        try:
-            input_data = {"prompt": task["prompt"]}
+from config import BOT_TOKEN
 
-            if task["type"] == "photo_video" and task["photo"]:
-                input_data["image"] = task["photo"]
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 
-            result = await asyncio.to_thread(
-                replicate_client.run,
-                KLING_MODEL,
-                input_data,
-            )
-
-            await bot.send_message(
-                task["chat_id"],
-                f"✅ Готово:\n{result}"
-            )
-
-        except Exception as e:
-            logger.exception("Worker error")
-            await bot.send_message(
-                task["chat_id"],
-                "❌ Произошла ошибка при генерации"
-            )
-        finally:
-            queue.task_done()
+dp = Dispatcher()
