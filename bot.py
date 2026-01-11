@@ -1,9 +1,13 @@
+# ===========================
+# bot.py — Production Ready
+# ===========================
 import os
 import asyncio
 import logging
 import tempfile
-from contextlib import asynccontextmanager
-from typing import Any, Dict, Literal
+from contextlib import asynccontextmanager, ExitStack
+from dataclasses import dataclass, field
+from typing import Any, Dict, Literal, List, Optional
 
 import aiohttp
 import replicate
@@ -74,7 +78,7 @@ bot = Bot(
 dp = Dispatcher()
 
 # =====================================================
-# MODELS / STATE
+# CONSTANTS
 # =====================================================
 Mode = Literal["video", "image", "music", "gpt"]
 
@@ -82,36 +86,73 @@ KLING_MODEL = "kwaivgi/kling-v2.5-turbo-pro"
 IMAGE_MODEL = "bytedance/seedream-4"
 MUSIC_MODEL = "meta/musicgen:671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb"
 
-queue: asyncio.Queue["Task"] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
-user_modes: Dict[int, Mode] = {}
-user_locks: Dict[int, asyncio.Semaphore] = {}
+# =====================================================
+# USER SESSION
+# =====================================================
+@dataclass
+class UserSession:
+    mode: Optional[Mode] = None
+    images: List[bytes] = field(default_factory=list)
+    style: str = "cinematic"
+    duration: int = 5
+    lock: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
+
+user_sessions: Dict[int, UserSession] = {}
+
+def get_session(user_id: int) -> UserSession:
+    return user_sessions.setdefault(user_id, UserSession())
 
 # =====================================================
-# DATA
+# TASK
 # =====================================================
+@dataclass(slots=True)
 class Task:
-    __slots__ = ("mode", "chat_id", "prompt", "user_id")
+    mode: Mode
+    chat_id: int
+    user_id: int
+    prompt: str
 
-    def __init__(self, mode: Mode, chat_id: int, user_id: int, prompt: str):
-        self.mode = mode
-        self.chat_id = chat_id
-        self.user_id = user_id
-        self.prompt = prompt
+queue: asyncio.Queue[Task] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
 
 # =====================================================
-# KEYBOARD
+# KEYBOARDS
 # =====================================================
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🎬 Видео", callback_data="video"),
-                InlineKeyboardButton(text="🖼 Изображение", callback_data="image"),
+                InlineKeyboardButton("🎬 Видео", callback_data="video"),
+                InlineKeyboardButton("🖼 Изображение", callback_data="image"),
             ],
             [
-                InlineKeyboardButton(text="🎵 Музыка", callback_data="music"),
-                InlineKeyboardButton(text="🤖 GPT", callback_data="gpt"),
+                InlineKeyboardButton("🎵 Музыка", callback_data="music"),
+                InlineKeyboardButton("🤖 GPT", callback_data="gpt"),
             ],
+        ]
+    )
+
+def style_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton("🎬 Cinematic", callback_data="style_cinematic"),
+                InlineKeyboardButton("🎨 Anime", callback_data="style_anime"),
+            ],
+            [
+                InlineKeyboardButton("🤖 Cyberpunk", callback_data="style_cyberpunk"),
+                InlineKeyboardButton("📸 Realistic", callback_data="style_realistic"),
+            ],
+        ]
+    )
+
+def duration_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton("⏱ 5 сек", callback_data="dur_5"),
+                InlineKeyboardButton("⏱ 10 сек", callback_data="dur_10"),
+                InlineKeyboardButton("⏱ 15 сек", callback_data="dur_15"),
+            ]
         ]
     )
 
@@ -120,6 +161,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
 # =====================================================
 @dp.message(CommandStart())
 async def start(msg: Message):
+    user_sessions.pop(msg.from_user.id, None)
     await msg.answer(
         "🔥 <b>AI Studio Bot</b>\n\nВыбери режим:",
         reply_markup=main_keyboard(),
@@ -127,54 +169,89 @@ async def start(msg: Message):
 
 @dp.callback_query(F.data.in_({"video", "image", "music", "gpt"}))
 async def select_mode(cb: CallbackQuery):
-    user_modes[cb.from_user.id] = cb.data  # type: ignore
-    await cb.message.answer("✍️ Введите запрос:")
+    session = get_session(cb.from_user.id)
+    session.mode = cb.data  # type: ignore
+    session.images.clear()
+
+    if cb.data == "video":
+        await cb.message.answer("📸 Отправь 1–5 фото")
+    else:
+        await cb.message.answer("✍️ Введите запрос")
+
+@dp.message(F.photo)
+async def handle_photo(msg: Message):
+    session = get_session(msg.from_user.id)
+    if session.mode != "video":
+        return
+
+    if len(session.images) >= 5:
+        await msg.answer("⚠️ Максимум 5 фото")
+        return
+
+    file = await bot.get_file(msg.photo[-1].file_id)
+    data = await bot.download_file(file.file_path)
+    session.images.append(data.read())
+
+    await msg.answer(
+        f"📸 Фото добавлено ({len(session.images)}/5)\nВыбери стиль:",
+        reply_markup=style_keyboard(),
+    )
+
+@dp.callback_query(F.data.startswith("style_"))
+async def set_style(cb: CallbackQuery):
+    get_session(cb.from_user.id).style = cb.data.replace("style_", "")
+    await cb.message.answer("⏱ Выбери длительность", reply_markup=duration_keyboard())
+
+@dp.callback_query(F.data.startswith("dur_"))
+async def set_duration(cb: CallbackQuery):
+    get_session(cb.from_user.id).duration = int(cb.data.replace("dur_", ""))
+    await cb.message.answer("✍️ Теперь введи текст")
 
 @dp.message(F.text)
 async def handle_text(msg: Message):
-    mode = user_modes.get(msg.from_user.id)
-    if not mode:
-        await msg.answer("⚠️ Сначала выбери режим кнопками ниже.")
+    session = get_session(msg.from_user.id)
+    if not session.mode:
+        await msg.answer("⚠️ Сначала выбери режим")
         return
 
-    lock = user_locks.setdefault(msg.from_user.id, asyncio.Semaphore(1))
-
-    if queue.full():
-        await msg.answer("🚫 Очередь переполнена. Попробуйте позже.")
+    try:
+        await asyncio.wait_for(
+            queue.put(Task(session.mode, msg.chat.id, msg.from_user.id, msg.text)),
+            timeout=2,
+        )
+    except asyncio.TimeoutError:
+        await msg.answer("🚫 Очередь перегружена")
         return
 
-    await queue.put(Task(mode, msg.chat.id, msg.from_user.id, msg.text))
-    await msg.answer("⏳ Запрос принят, обрабатываю…")
+    await msg.answer("⏳ Запрос принят")
 
 # =====================================================
 # REPLICATE
 # =====================================================
 async def run_replicate(model: str, payload: Dict[str, Any]) -> Any:
     async with replicate_semaphore:
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                replicate_client.run,
-                model,
-                input=payload,
-            ),
-            timeout=180,
-        )
+        for attempt in range(3):
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(replicate_client.run, model, input=payload),
+                    timeout=300,
+                )
+            except Exception as e:
+                logger.warning("Replicate retry %s: %s", attempt + 1, e)
+                await asyncio.sleep(2)
+        raise RuntimeError("Replicate failed")
 
 # =====================================================
 # OUTPUT
 # =====================================================
 async def send_output(chat_id: int, output: Any, ext: str, session: aiohttp.ClientSession):
-    data: bytes | None = None
+    data: Optional[bytes] = None
 
     if isinstance(output, FileOutput):
         data = await asyncio.to_thread(output.read)
-
     elif isinstance(output, str):
-        async with session.get(output) as resp:
-            if resp.status != 200:
-                raise RuntimeError("Download failed")
-            data = await resp.read()
-
+        async with session.get(output, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            data = await r.read()
     elif isinstance(output, list):
         for item in output:
             try:
@@ -183,7 +260,7 @@ async def send_output(chat_id: int, output: Any, ext: str, session: aiohttp.Clie
                 continue
 
     if not data:
-        raise RuntimeError("Unsupported output")
+        raise RuntimeError("Empty output")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as f:
         f.write(data)
@@ -208,32 +285,56 @@ async def worker(worker_id: int, session: aiohttp.ClientSession):
 
     while True:
         task = await queue.get()
-        lock = user_locks.get(task.user_id)
+        session_user = get_session(task.user_id)
 
         try:
-            async with lock:
-                if task.mode == "gpt":
-                    res = await openai_client.responses.create(
+            async with session_user.lock:
+                if task.mode == "video":
+                    if not session_user.images:
+                        raise RuntimeError("No images")
+
+                    paths: List[str] = []
+                    with ExitStack() as stack:
+                        for img in session_user.images:
+                            f = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                            f.write(img)
+                            f.close()
+                            paths.append(f.name)
+
+                        files = [stack.enter_context(open(p, "rb")) for p in paths]
+
+                        output = await run_replicate(
+                            KLING_MODEL,
+                            {
+                                "prompt": task.prompt,
+                                "images": files,
+                                "style": session_user.style,
+                                "duration": session_user.duration,
+                                "aspect_ratio": "9:16",
+                                "fps": 30,
+                            },
+                        )
+
+                    await send_output(task.chat_id, output, "mp4", session)
+
+                elif task.mode == "image":
+                    o = await run_replicate(IMAGE_MODEL, {"prompt": task.prompt})
+                    await send_output(task.chat_id, o, "jpg", session)
+
+                elif task.mode == "music":
+                    o = await run_replicate(MUSIC_MODEL, {"prompt": task.prompt})
+                    await send_output(task.chat_id, o, "mp3", session)
+
+                else:
+                    r = await openai_client.responses.create(
                         model="gpt-4.1-mini",
                         input=task.prompt,
                     )
-                    await bot.send_message(task.chat_id, res.output_text)
-                else:
-                    if task.mode == "video":
-                        output, ext = await run_replicate(KLING_MODEL, {"prompt": task.prompt}), "mp4"
-                    elif task.mode == "image":
-                        output, ext = await run_replicate(IMAGE_MODEL, {"prompt": task.prompt}), "jpg"
-                    else:
-                        output, ext = await run_replicate(
-                            MUSIC_MODEL,
-                            {"prompt": task.prompt, "output_format": "mp3"},
-                        ), "mp3"
-
-                    await send_output(task.chat_id, output, ext, session)
+                    await bot.send_message(task.chat_id, r.output_text)
 
         except Exception:
             logger.exception("Task failed")
-            await bot.send_message(task.chat_id, "❌ Ошибка обработки.")
+            await bot.send_message(task.chat_id, "❌ Ошибка обработки")
         finally:
             queue.task_done()
 
@@ -242,7 +343,7 @@ async def worker(worker_id: int, session: aiohttp.ClientSession):
 # =====================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    session = aiohttp.ClientSession()
+    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     workers = [asyncio.create_task(worker(i, session)) for i in range(WORKERS)]
 
     if BASE_URL and BASE_URL.startswith("https://"):
@@ -260,22 +361,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@app.get("/")
-async def health():
-    return {"status": "ok"}
-
 @app.post("/webhook")
 async def telegram_webhook(req: Request):
-    if WEBHOOK_SECRET:
-        if req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-            raise HTTPException(status_code=403)
+    if WEBHOOK_SECRET and req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403)
 
-    try:
-        update = await req.json()
-        await dp.feed_raw_update(bot, update)
-    except Exception:
-        logger.exception("Webhook error")
-
+    await dp.feed_raw_update(bot, await req.json())
     return {"ok": True}
 
 # =====================================================
