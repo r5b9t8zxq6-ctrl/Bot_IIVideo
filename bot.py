@@ -1,46 +1,70 @@
 import os
 import asyncio
-from typing import Dict, Literal
-from fastapi import FastAPI, Request
+import logging
+from typing import Dict, Literal, TypedDict, Optional
+
+from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    CallbackQuery,
-)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from asyncio import Queue
+
 import replicate
 from openai import OpenAI
 
-# ================== CONFIG ==================
+# =========================================================
+# LOGGING
+# =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("ai-studio-bot")
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://bot-iivideo.onrender.com
+# =========================================================
+# CONFIG VALIDATION
+# =========================================================
+
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return value
+
+
+BOT_TOKEN = require_env("BOT_TOKEN")
+REPLICATE_API_TOKEN = require_env("REPLICATE_API_TOKEN")
+OPENAI_API_KEY = require_env("OPENAI_API_KEY")
+WEBHOOK_URL = require_env("WEBHOOK_URL")
+
 WEBHOOK_PATH = "/webhook"
-FULL_WEBHOOK_URL = WEBHOOK_URL + WEBHOOK_PATH
+FULL_WEBHOOK_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
 
 KLING_MODEL = "kwaivgi/kling-v2.5-turbo-pro"
+
+# =========================================================
+# CLIENTS
+# =========================================================
 
 replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ================== BOT ==================
+# =========================================================
+# BOT
+# =========================================================
 
 bot = Bot(
-    BOT_TOKEN,
+    token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 
 dp = Dispatcher()
 app = FastAPI()
 
-# ================== STATE ==================
+# =========================================================
+# TYPES
+# =========================================================
 
 Mode = Literal[
     "video",
@@ -53,14 +77,29 @@ Mode = Literal[
     "insta_voice",
 ]
 
+
+class TaskPayload(TypedDict):
+    type: Mode
+    chat_id: int
+    prompt: Optional[str]
+    topic: Optional[str]
+    photo: Optional[str]
+
+
+# =========================================================
+# STATE (bounded & safe)
+# =========================================================
+
 user_modes: Dict[int, Mode] = {}
 user_photos: Dict[int, str] = {}
 
-queue: Queue = Queue()
+queue: asyncio.Queue[TaskPayload] = asyncio.Queue(maxsize=100)
 
-# ================== UI ==================
+# =========================================================
+# UI
+# =========================================================
 
-def main_keyboard():
+def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -82,68 +121,41 @@ def main_keyboard():
         ]
     )
 
-def instagram_keyboard():
+
+def instagram_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎬 Сценарий + субтитры",
-                    callback_data="insta_script",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎙 Текст для озвучки",
-                    callback_data="insta_voice",
-                )
-            ],
+            [InlineKeyboardButton(text="🎬 Сценарий + субтитры", callback_data="insta_script")],
+            [InlineKeyboardButton(text="🎙 Текст для озвучки", callback_data="insta_voice")],
         ]
     )
 
-# ================== START ==================
+# =========================================================
+# HANDLERS
+# =========================================================
 
 @dp.message(F.text == "/start")
-async def start(msg: Message):
-    await msg.answer(
-        "🔥 <b>AI Studio Bot</b>\n\nВыбери режим:",
-        reply_markup=main_keyboard(),
-    )
+async def start_handler(msg: Message) -> None:
+    await msg.answer("🔥 <b>AI Studio Bot</b>\n\nВыбери режим:", reply_markup=main_keyboard())
 
-# ================== CALLBACKS ==================
 
 @dp.callback_query()
-async def callbacks(call: CallbackQuery):
+async def callback_handler(call: CallbackQuery) -> None:
     user_id = call.from_user.id
-    data = call.data
+    mode = call.data
 
-    if data in {
-        "video", "image", "photo_video",
-        "gpt", "gpt_kling"
-    }:
-        user_modes[user_id] = data
+    user_modes[user_id] = mode  # validated by UI
+
+    if mode == "instagram":
+        await call.message.answer("📸 Instagram режим:", reply_markup=instagram_keyboard())
+    else:
         await call.message.answer("✍️ Отправь описание")
-        await call.answer()
-        return
 
-    if data == "instagram":
-        user_modes[user_id] = "instagram"
-        await call.message.answer(
-            "📸 Instagram режим:",
-            reply_markup=instagram_keyboard(),
-        )
-        await call.answer()
-        return
+    await call.answer()
 
-    if data in {"insta_script", "insta_voice"}:
-        user_modes[user_id] = data
-        await call.message.answer("✍️ Напиши тему Reels")
-        await call.answer()
-        return
-
-# ================== PHOTO ==================
 
 @dp.message(F.photo)
-async def handle_photo(msg: Message):
+async def photo_handler(msg: Message) -> None:
     if user_modes.get(msg.from_user.id) != "photo_video":
         return
 
@@ -151,10 +163,9 @@ async def handle_photo(msg: Message):
     user_photos[msg.from_user.id] = file.file_path
     await msg.answer("✍️ Теперь отправь описание видео")
 
-# ================== TEXT ==================
 
 @dp.message(F.text)
-async def handle_text(msg: Message):
+async def text_handler(msg: Message) -> None:
     user_id = msg.from_user.id
     mode = user_modes.get(user_id)
 
@@ -162,103 +173,110 @@ async def handle_text(msg: Message):
         await msg.answer("⚠️ Выбери режим через /start")
         return
 
-    if mode == "photo_video":
-        photo = user_photos.get(user_id)
-        if not photo:
-            await msg.answer("📸 Сначала отправь фото")
-            return
-
-        await queue.put({
-            "type": "photo_video",
-            "chat_id": msg.chat.id,
-            "photo": photo,
-            "prompt": msg.text,
-        })
-        await msg.answer("🎬 Генерирую видео...")
-        return
-
-    if mode in {"insta_script", "insta_voice"}:
-        await queue.put({
-            "type": mode,
-            "chat_id": msg.chat.id,
-            "topic": msg.text,
-        })
-        await msg.answer("🧠 GPT генерирует контент...")
-        return
-
-    await queue.put({
+    payload: TaskPayload = {
         "type": mode,
         "chat_id": msg.chat.id,
-        "prompt": msg.text,
-    })
+        "prompt": None,
+        "topic": None,
+        "photo": None,
+    }
+
+    if mode == "photo_video":
+        payload["photo"] = user_photos.get(user_id)
+        payload["prompt"] = msg.text
+    elif mode in {"insta_script", "insta_voice"}:
+        payload["topic"] = msg.text
+    else:
+        payload["prompt"] = msg.text
+
+    try:
+        queue.put_nowait(payload)
+    except asyncio.QueueFull:
+        await msg.answer("⏳ Сервер перегружен, попробуй позже")
+        return
+
     await msg.answer("⏳ Запрос принят")
 
-# ================== WORKER ==================
+# =========================================================
+# WORKER
+# =========================================================
 
-async def worker():
+async def worker() -> None:
+    logger.info("Worker started")
+
     while True:
         task = await queue.get()
         try:
-            if task["type"] == "photo_video":
-                photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{task['photo']}"
-                video = replicate_client.run(
-                    KLING_MODEL,
-                    input={"image": photo_url, "prompt": task["prompt"]},
-                )
-                await bot.send_video(task["chat_id"], video=video)
+            await process_task(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Task failed")
+            await bot.send_message(task["chat_id"], "❌ Внутренняя ошибка")
+        finally:
+            queue.task_done()
 
-            elif task["type"] == "gpt_kling":
-                gpt = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "Создай сценарий и video prompt."},
-                        {"role": "user", "content": task["prompt"]},
-                    ],
-                )
-                prompt = gpt.choices[0].message.content
-                video = replicate_client.run(KLING_MODEL, input={"prompt": prompt})
-                await bot.send_video(task["chat_id"], video=video)
 
-            elif task["type"] == "insta_script":
-                gpt = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "Сценарий + субтитры Reels"},
-                        {"role": "user", "content": task["topic"]},
-                    ],
-                )
-                await bot.send_message(task["chat_id"], gpt.choices[0].message.content)
+async def process_task(task: TaskPayload) -> None:
+    t = task["type"]
 
-            elif task["type"] == "insta_voice":
-                gpt = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "Текст для озвучки Reels"},
-                        {"role": "user", "content": task["topic"]},
-                    ],
-                )
-                await bot.send_message(task["chat_id"], gpt.choices[0].message.content)
+    if t == "photo_video":
+        photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{task['photo']}"
+        video = await asyncio.to_thread(
+            replicate_client.run,
+            KLING_MODEL,
+            {"image": photo_url, "prompt": task["prompt"]},
+        )
+        await bot.send_video(task["chat_id"], video)
 
-        except Exception as e:
-            await bot.send_message(task["chat_id"], f"❌ Ошибка: {e}")
+    elif t == "gpt_kling":
+        gpt = await asyncio.to_thread(
+            openai_client.chat.completions.create,
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Создай сценарий и video prompt."},
+                {"role": "user", "content": task["prompt"]},
+            ],
+        )
+        prompt = gpt.choices[0].message.content
+        video = await asyncio.to_thread(
+            replicate_client.run,
+            KLING_MODEL,
+            {"prompt": prompt},
+        )
+        await bot.send_video(task["chat_id"], video)
 
-        queue.task_done()
+    elif t in {"insta_script", "insta_voice"}:
+        gpt = await asyncio.to_thread(
+            openai_client.chat.completions.create,
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Контент для Reels"},
+                {"role": "user", "content": task["topic"]},
+            ],
+        )
+        await bot.send_message(task["chat_id"], gpt.choices[0].message.content)
 
-# ================== WEBHOOK ==================
+# =========================================================
+# FASTAPI LIFECYCLE
+# =========================================================
 
 @app.on_event("startup")
-async def startup():
-    print("🚀 STARTUP")
+async def startup() -> None:
+    logger.info("Startup")
     await bot.set_webhook(FULL_WEBHOOK_URL)
-    asyncio.create_task(worker())
+    app.state.worker_task = asyncio.create_task(worker())
+
 
 @app.on_event("shutdown")
-async def shutdown():
+async def shutdown() -> None:
+    logger.info("Shutdown")
+    app.state.worker_task.cancel()
     await bot.delete_webhook()
 
+
 @app.post(WEBHOOK_PATH)
-async def webhook(request: Request):
+async def telegram_webhook(request: Request):
     update = await request.json()
-    print("📩 INCOMING UPDATE:", update)
     await dp.feed_raw_update(bot, update)
     return {"ok": True}
