@@ -8,6 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Literal, List, Optional, Any
+from aiogram.types import Update
 
 import replicate
 from dotenv import load_dotenv
@@ -116,8 +117,9 @@ async def cleanup_sessions():
 # =====================================================
 @dataclass(slots=True)
 class Task:
-    mode: Mode
+    user_id: int
     chat_id: int
+    mode: Mode
     prompt: str
     images: List[bytes]
     style: str
@@ -168,13 +170,14 @@ async def handle_text(msg: Message):
 
     try:
         queue.put_nowait(Task(
-            mode=s.mode,
-            chat_id=msg.chat.id,
-            prompt=msg.text,
-            images=list(s.images),
-            style=s.style,
-            duration=s.duration,
-        ))
+    user_id=uid,
+    chat_id=msg.chat.id,
+    mode=s.mode,
+    prompt=msg.text,
+    images=list(s.images),
+    style=s.style,
+    duration=s.duration,
+))
         user_tasks[uid] = user_tasks.get(uid, 0) + 1
         await msg.answer("⏳ Запрос принят")
     except asyncio.QueueFull:
@@ -216,8 +219,8 @@ async def worker(worker_id: int):
             logger.exception("Worker error")
             await bot.send_message(task.chat_id, "❌ Ошибка обработки")
         finally:
-            user_tasks[task.chat_id] -= 1
-            queue.task_done()
+    user_tasks[task.user_id] -= 1
+    queue.task_done()
 
 # =====================================================
 # FASTAPI
@@ -243,7 +246,10 @@ app = FastAPI(lifespan=lifespan)
 async def webhook(req: Request):
     if WEBHOOK_SECRET and req.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         raise HTTPException(403)
-    await dp.feed_raw_update(bot, await req.json())
+
+    update = Update.model_validate(await req.json())
+    await dp.feed_update(bot, update)
+
     return {"ok": True}
 
 # =====================================================
