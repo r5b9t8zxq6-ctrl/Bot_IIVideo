@@ -7,6 +7,7 @@ from router import router
 from worker import worker
 from config import FULL_WEBHOOK_URL, WEBHOOK_PATH
 from logging import logger
+from logger import setup_logging
 
 dp.include_router(router)
 
@@ -21,6 +22,13 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown")
 
 app = FastAPI(lifespan=lifespan)
+
+setup_logging()
+
+import logging
+logger = logging.getLogger(__name__)
+
+logger.info("Bot started")
 
 @app.post(WEBHOOK_PATH)
 async def webhook(request: Request):
