@@ -207,24 +207,18 @@ async def worker(worker_id: int):
         task = await queue.get()
         try:
             if task.mode == "video":
-                images = [
-                    File(data=img, filename="frame.jpg", content_type="image/jpeg")
-                    for img in task.images
-                ]
-
-                output = await run_replicate(
-                    KLING_MODEL,
-                    {
-                        "prompt": task.prompt,
-                        "images": images,
-                        "style": task.style,
-                        "duration": task.duration,
-                        "aspect_ratio": "9:16",
-                        "fps": 30,
-                    },
-                )
-
-                await bot.send_video(task.chat_id, output)
+    output = await run_replicate(
+        KLING_MODEL,
+        {
+            "prompt": task.prompt,
+            "images": task.images,  # 🔥 bytes напрямую
+            "style": task.style,
+            "duration": task.duration,
+            "aspect_ratio": "9:16",
+            "fps": 30,
+        },
+    )
+    await bot.send_video(task.chat_id, output)
 
             elif task.mode == "image":
                 out = await run_replicate(IMAGE_MODEL, {"prompt": task.prompt})
