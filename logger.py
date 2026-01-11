@@ -1,4 +1,5 @@
 import logging
+from logger import setup_logger
 
 logging.basicConfig(
     level=logging.INFO,
